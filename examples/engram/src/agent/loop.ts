@@ -1,5 +1,5 @@
 import { envelopeForIntents, routeIntent, type NextStep } from "./intents";
-import { consecutiveErrors, deriveStatus, stepsThisTurn, type Thread } from "./thread";
+import { consecutiveErrors, deriveStatus, lastEvent, stepsThisTurn, type Thread } from "./thread";
 import { executeStep } from "./execute";
 import { compactError, renderUserMessage } from "./render";
 import { buildSystemPrompt } from "../prompts/nextstep";
@@ -77,7 +77,9 @@ export async function agentLoop(threadId: string, deps: EngramDeps): Promise<Thr
             });
             continue;
           }
-          scheduleWake(deps, thread.id, wake.wakeAt, step.reason);
+          // Link the row to this sleep_until event so a superseded sleep's
+          // row is recognized as stale by the scheduler.
+          scheduleWake(deps, thread.id, wake.wakeAt, step.reason, lastEvent(thread)!.seq);
         }
         break loop;
 

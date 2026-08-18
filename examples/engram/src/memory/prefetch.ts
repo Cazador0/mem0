@@ -22,11 +22,15 @@ export async function prefetchArchival(deps: EngramDeps, thread: Thread): Promis
     topK: 5,
   });
   if (results.length === 0) return null;
+  // Memory content derives from user text — neutralize angle brackets so it
+  // cannot forge event blocks in the rendered context (same rule as render.ts).
+  const escape = (text: string) => text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const lines = results.map(
-    r => `- (${r.payload.memoryType}, ${r.payload.createdAt.slice(0, 10)}, score ${r.score.toFixed(2)}) ${r.payload.content}`,
+    r =>
+      `- (${r.payload.memoryType}, ${r.payload.createdAt.slice(0, 10)}, score ${r.score.toFixed(2)}) ${escape(r.payload.content)}`,
   );
   const block =
-    `<archival_recall query=${JSON.stringify(seed.slice(0, 120))}>\n` +
+    `<archival_recall query=${JSON.stringify(escape(seed.slice(0, 120)))}>\n` +
     `${lines.join("\n")}\n` +
     `(pre-fetched from archival memory — to update or delete one, first locate it with archival_search to get a ref)\n` +
     `</archival_recall>`;

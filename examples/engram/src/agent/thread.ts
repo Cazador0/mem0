@@ -113,16 +113,22 @@ export function stepCount(thread: Thread): number {
 }
 
 /**
- * Steps taken in the CURRENT turn — tool_calls after the latest human input.
- * The loop budget uses this (factor 10) so the budget resets each time the
- * human speaks; a lifetime count would permanently brick long-lived threads.
+ * Steps taken in the CURRENT turn — tool_calls since the latest turn boundary.
+ * The loop budget uses this (factor 10) so it resets whenever a new turn
+ * starts; a lifetime count would permanently brick long-lived threads.
+ *
+ * Turn boundaries: human input (user_input/human_response), a scheduler wake
+ * (system_note — otherwise a recurring sleep/wake thread accumulates steps
+ * across cycles until it silently stalls forever), and a human approval or
+ * denial (tool_responses the resume paths mark with via_human).
  */
 export function stepsThisTurn(thread: Thread): number {
   let steps = 0;
   for (let i = thread.events.length - 1; i >= 0; i--) {
-    const type = thread.events[i]!.type;
-    if (type === "user_input" || type === "human_response") break;
-    if (type === "tool_call") steps++;
+    const event = thread.events[i]!;
+    if (event.type === "user_input" || event.type === "human_response" || event.type === "system_note") break;
+    if (event.type === "tool_response" && (event.data as { via_human?: boolean })?.via_human === true) break;
+    if (event.type === "tool_call") steps++;
   }
   return steps;
 }

@@ -2,6 +2,8 @@
 
 - **Event vocabulary is closed** (`EVENT_TYPES` in `thread.ts`): `user_input | system_note | tool_call | tool_response | human_response | error | memory_write`. Adding a type means updating the derived-status predicates and `render.ts` in the same change — they are the only consumers allowed to interpret types.
 - **Status is derived, never stored.** `threads.status_hint` is a display cache only; every decision routes through `deriveStatus`/`awaitingApproval`/`awaitingHumanResponse` over the log tail.
+- **Turn boundaries for the step budget**: `user_input`, `human_response`, `system_note` (scheduler wake), and `tool_response` events carrying `via_human: true` (approval/denial). Every path that resumes a thread with a human decision must set that flag, or long approval chains exhaust the budget.
+- **Every loop entry goes through `withThreadLock`** (`orchestration/lock.ts`) — HTTP create/resume, scheduler wakes, and the CLI. A new channel that calls `agentLoop` without the lock reintroduces interleaved logs.
 - **The tool_call event is persisted BEFORE execution.** This is what makes approval-replay work: the resume path re-executes `eventAsStep(lastEvent(thread))` verbatim. Never execute first and record after.
 - **Two-switch split**: `routeIntent` (control-flow policy: sync/gated/break/terminal) and `executeStep` (pure execution) stay separate functions. Policy changes (e.g. gating a new intent) happen in `routeIntent` only.
 - **`render.ts` is the single seam deciding what the model sees.** Compaction, redaction, error-hiding, and memory injection happen there, read-side only. The canonical log is never mutated by rendering.

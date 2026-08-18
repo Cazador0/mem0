@@ -232,7 +232,8 @@ export class ArchivalMemory {
   /** Rewrite a memory's content: audits before/after, rehashes, re-embeds, relinks entities. */
   async update(id: string, newContent: string, actorId?: string): Promise<{ ok: boolean; message: string }> {
     const row = this.db.query("SELECT * FROM memories WHERE id = ?").get(id) as RawRow | null;
-    if (!row) return { ok: false, message: `no memory with id ${id}` };
+    // Result strings never carry raw memory UUIDs — they flow into prompts.
+    if (!row) return { ok: false, message: "memory not found — it may have been deleted already" };
 
     const newHash = this.contentHash(newContent);
     const collision = this.db
@@ -286,7 +287,7 @@ export class ArchivalMemory {
   /** Delete a memory. The history row survives with is_deleted = 1 (soft in audit). */
   delete(id: string, actorId?: string): { ok: boolean; message: string } {
     const row = this.db.query("SELECT * FROM memories WHERE id = ?").get(id) as RawRow | null;
-    if (!row) return { ok: false, message: `no memory with id ${id}` };
+    if (!row) return { ok: false, message: "memory not found — it may have been deleted already" };
     const write = this.db.transaction(() => {
       this.addHistory(id, row.content, null, "DELETE", true, actorId);
       this.db.query("DELETE FROM memories WHERE id = ?").run(id);

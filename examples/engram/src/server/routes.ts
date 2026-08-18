@@ -3,6 +3,7 @@ import { agentLoop } from "../agent/loop";
 import { executeStep } from "../agent/execute";
 import { extractFromThread } from "../memory/extraction";
 import { outwardText } from "../agent/render";
+import { withThreadLock } from "../orchestration/lock";
 import {
   awaitingApproval,
   awaitingHumanResponse,
@@ -32,30 +33,6 @@ const ResumeBody = z.discriminatedUnion("type", [
   z.object({ type: z.literal("response"), response: z.string().min(1) }),
 ]);
 
-/**
- * Per-thread serialization: Bun.serve handles requests concurrently, and the
- * approval branch awaits between the derived-status check and the event append
- * — without a lock, two simultaneous approvals would both pass the check,
- * execute the recorded step twice, and interleave two loops into one log.
- */
-const threadLocks = new Map<string, Promise<void>>();
-
-async function withThreadLock<T>(threadId: string, fn: () => Promise<T>): Promise<T> {
-  const previous = threadLocks.get(threadId) ?? Promise.resolve();
-  const run = previous.then(fn, fn);
-  const chain = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  threadLocks.set(threadId, chain);
-  void chain.then(() => {
-    // Drop the entry once the chain we stored has fully settled — a newer
-    // chain replaces it first if more work queued behind us.
-    if (threadLocks.get(threadId) === chain) threadLocks.delete(threadId);
-  });
-  return run;
-}
-
 export function createServer(deps: EngramDeps) {
   return Bun.serve({
     port: deps.config.port,
@@ -63,8 +40,13 @@ export function createServer(deps: EngramDeps) {
       try {
         return await route(req, deps);
       } catch (err) {
+        const message = (err as Error).message ?? String(err);
+        // Routine client mistakes are 4xx, not 500s that page someone.
+        if (message.startsWith("thread not found")) {
+          return Response.json({ error: message }, { status: 404 });
+        }
         console.error(`[engram] request failed:`, err);
-        return Response.json({ error: (err as Error).message }, { status: 500 });
+        return Response.json({ error: message }, { status: 500 });
       }
     },
   });
@@ -79,13 +61,13 @@ async function route(req: Request, deps: EngramDeps): Promise<Response> {
   }
 
   if (url.pathname === "/threads" && req.method === "POST") {
-    const body = CreateThreadBody.safeParse(await req.json());
+    const body = CreateThreadBody.safeParse(await parseJson(req));
     if (!body.success) return badRequest(body.error.message);
     const { message, agent_id, user_id } = body.data;
     if (!deps.registry.get(agent_id)) return badRequest(`unknown agent "${agent_id}"`);
     const thread = deps.store.createThread(agent_id, { userId: user_id, agentId: agent_id });
     deps.store.appendEvent(thread.id, "user_input", message);
-    const finished = await agentLoop(thread.id, deps);
+    const finished = await withThreadLock(thread.id, () => agentLoop(thread.id, deps));
     backgroundExtraction(deps, thread.id);
     return Response.json(threadView(finished));
   }
@@ -100,11 +82,19 @@ async function route(req: Request, deps: EngramDeps): Promise<Response> {
   }
 
   if (parts[0] === "threads" && parts[2] === "response" && parts.length === 3 && req.method === "POST") {
-    const body = await req.json();
+    const body = await parseJson(req);
     return withThreadLock(parts[1]!, () => resumeThread(parts[1]!, body, deps));
   }
 
   return Response.json({ error: "not found" }, { status: 404 });
+}
+
+async function parseJson(req: Request): Promise<unknown> {
+  try {
+    return await req.json();
+  } catch {
+    return null; // schema validation turns this into a 400, not a 500
+  }
 }
 
 async function resumeThread(threadId: string, rawBody: unknown, deps: EngramDeps): Promise<Response> {
@@ -124,12 +114,14 @@ async function resumeThread(threadId: string, rawBody: unknown, deps: EngramDeps
       const result = await executeStep(recorded, thread, deps, {
         runLoop: id => agentLoop(id, deps),
       });
-      deps.store.appendEvent(thread.id, "tool_response", result);
+      // via_human marks a human decision: it starts a new turn for the step budget.
+      deps.store.appendEvent(thread.id, "tool_response", { ...result, via_human: true });
     } else {
       deps.store.appendEvent(thread.id, "tool_response", {
         intent: recorded.intent,
         ok: false,
         result: `user denied the operation with feedback: "${body.data.comment ?? "no comment"}"`,
+        via_human: true,
       });
     }
   } else {
