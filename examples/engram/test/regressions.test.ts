@@ -103,11 +103,13 @@ describe("review regressions", () => {
 
   test("update() to content duplicating another memory returns ok:false, not a thrown UNIQUE error", async () => {
     const { deps } = testWorld();
-    const tea = await deps.archival.insert({ content: "User likes tea.", scope: SCOPE });
+    await deps.archival.insert({ content: "User likes tea.", scope: SCOPE });
     const coffee = await deps.archival.insert({ content: "User likes coffee.", scope: SCOPE });
     const result = await deps.archival.update(coffee.id, "User likes tea.");
     expect(result.ok).toBe(false);
-    expect(result.message).toContain(tea.id);
+    expect(result.message).toContain("duplicates");
+    // Readable results never leak raw memory UUIDs (constitution IV).
+    expect(result.message).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}/);
     expect(deps.archival.getById(coffee.id)?.content).toBe("User likes coffee.");
   });
 
@@ -155,6 +157,40 @@ describe("review regressions", () => {
 
     expect(renderUserMessage(finished, null)).not.toContain(id); // prompt: refs only
     expect(buildRefMap(finished).get(1)).toBe(id); // log: id preserved for replay
+
+    // memory_write annotations must not leak their ids either.
+    const rendered = renderEvent({
+      id: "e",
+      threadId: thread.id,
+      seq: 99,
+      type: "memory_write",
+      data: { count: 1, ids: [id] },
+      ts: "2026-08-18T00:00:00.000Z",
+    });
+    expect(rendered).not.toContain(id);
+  });
+
+  test("malformed sleep_until gets a readable retry error instead of a silent sleep", async () => {
+    // Note: JavaScriptCore's Date parser is lenient ("tomorrow at 9" parses to
+    // a date in 2001!), so the past-timestamp guard matters as much as the
+    // parseability guard.
+    const { deps } = testWorld({
+      script: [
+        step({ intent: "sleep_until", reason: "waiting" }), // neither field
+        step({ intent: "sleep_until", wake_at: "2001-01-01T00:00:00Z", reason: "waiting" }), // past
+        step({ intent: "sleep_until", delay_minutes: 30, reason: "waiting" }), // valid
+      ],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "check on the deploy later");
+    const finished = await agentLoop(thread.id, deps);
+
+    const feedback = finished.events.filter(e => e.type === "tool_response").map(e => (e.data as { result: string }).result);
+    expect(feedback[0]).toContain("exactly one");
+    expect(feedback[1]).toContain("past");
+    expect(deriveStatus(finished)).toBe("sleeping"); // corrected retry succeeded
+    const schedules = deps.db.query("SELECT wake_at FROM schedules").all() as Array<{ wake_at: string }>;
+    expect(schedules.length).toBe(1); // only the valid sleep wrote a row
   });
 
   test("spawning an agent that can itself spawn is refused (recursion guard)", async () => {
@@ -172,8 +208,10 @@ describe("review regressions", () => {
   });
 
   test("stale wakes are consumed without disturbing a thread that moved on", async () => {
+    // Note: the completing thread has only 2 events, below summarizeRun's
+    // 3-event minimum, so no procedural-summary fixture is needed.
     const { deps, llm } = testWorld({
-      script: [step({ intent: "complete_task", outcome: "success", summary: "done early" }), { summary: "run summary" }],
+      script: [step({ intent: "complete_task", outcome: "success", summary: "done early" })],
     });
     const thread = deps.store.createThread("engram", SCOPE);
     scheduleWake(deps, thread.id, new Date(Date.now() - 1000).toISOString(), "old sleep");

@@ -65,7 +65,19 @@ export async function agentLoop(threadId: string, deps: EngramDeps): Promise<Thr
 
       case "break":
         if (step.intent === "sleep_until") {
-          scheduleWake(deps, thread.id, resolveWakeAt(step), step.reason);
+          const wake = resolveWakeAt(step);
+          if (!wake.ok) {
+            // Malformed sleep gets the same readable-feedback treatment as any
+            // other bad intent: the model reads the error and retries, instead
+            // of the thread durably sleeping for a time nobody chose.
+            thread = appendAndReload(deps, thread.id, "tool_response", {
+              intent: step.intent,
+              ok: false,
+              result: wake.error,
+            });
+            continue;
+          }
+          scheduleWake(deps, thread.id, wake.wakeAt, step.reason);
         }
         break loop;
 
@@ -117,11 +129,23 @@ function escalateIfStuck(deps: EngramDeps, thread: Thread): boolean {
   return true;
 }
 
-function resolveWakeAt(step: Extract<NextStep, { intent: "sleep_until" }>): string {
-  if (step.wake_at) {
-    const parsed = new Date(step.wake_at);
-    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+type WakeResolution = { ok: true; wakeAt: string } | { ok: false; error: string };
+
+function resolveWakeAt(step: Extract<NextStep, { intent: "sleep_until" }>): WakeResolution {
+  const hasWakeAt = step.wake_at !== undefined;
+  const hasDelay = step.delay_minutes !== undefined;
+  if (hasWakeAt === hasDelay) {
+    return { ok: false, error: "sleep_until needs exactly one of wake_at (RFC3339) or delay_minutes" };
   }
-  const minutes = step.delay_minutes ?? 60;
-  return new Date(Date.now() + minutes * 60_000).toISOString();
+  if (hasWakeAt) {
+    const parsed = new Date(step.wake_at!);
+    if (Number.isNaN(parsed.getTime())) {
+      return { ok: false, error: `wake_at "${step.wake_at}" is not a parseable RFC3339 timestamp — use e.g. 2026-08-18T09:00:00Z or delay_minutes` };
+    }
+    if (parsed.getTime() <= Date.now()) {
+      return { ok: false, error: `wake_at "${step.wake_at}" resolves to the past — provide a future RFC3339 timestamp or delay_minutes` };
+    }
+    return { ok: true, wakeAt: parsed.toISOString() };
+  }
+  return { ok: true, wakeAt: new Date(Date.now() + step.delay_minutes! * 60_000).toISOString() };
 }

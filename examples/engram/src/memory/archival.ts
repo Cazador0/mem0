@@ -241,7 +241,8 @@ export class ArchivalMemory {
     if (collision) {
       return {
         ok: false,
-        message: `new content duplicates existing memory ${collision.id} — update that one, or delete this one instead`,
+        message:
+          "new content duplicates another existing memory in this scope — search for it and update that one, or delete this one instead",
       };
     }
 
@@ -261,12 +262,25 @@ export class ArchivalMemory {
       this.db.query("DELETE FROM memories_fts WHERE memory_id = ?").run(id);
       this.db.query("INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)").run(newContent, id);
     });
-    write.immediate();
+    try {
+      write.immediate();
+    } catch (err) {
+      // Same TOCTOU as insert(): the embed await sits between the collision
+      // pre-check and the write — honor the readable-result contract.
+      if (String((err as Error).message).includes("UNIQUE")) {
+        return {
+          ok: false,
+          message:
+            "new content duplicates another existing memory in this scope — search for it and update that one, or delete this one instead",
+        };
+      }
+      throw err;
+    }
 
     const scope = { userId: row.user_id, agentId: row.agent_id, runId: row.run_id };
     this.entities.unlinkMemory(id, scope);
     this.entities.linkMemory(id, newContent, scope);
-    return { ok: true, message: `memory ${id} updated` };
+    return { ok: true, message: "memory updated" };
   }
 
   /** Delete a memory. The history row survives with is_deleted = 1 (soft in audit). */
@@ -280,7 +294,7 @@ export class ArchivalMemory {
     });
     write.immediate();
     this.entities.unlinkMemory(id, { userId: row.user_id, agentId: row.agent_id, runId: row.run_id });
-    return { ok: true, message: `memory ${id} deleted (audit retained)` };
+    return { ok: true, message: "memory deleted (audit retained)" };
   }
 
   history(memoryId: string): HistoryRow[] {

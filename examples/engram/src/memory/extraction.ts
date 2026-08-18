@@ -32,12 +32,13 @@ export async function extractFromThread(
   }
   if (newMessages.length === 0) return { added: [] };
 
-  const recentContext = thread.events
-    .filter(e => e.seq <= thread.extractedSeq)
-    .map(conversationalText)
-    .filter((l): l is { role: string; text: string } => l !== null && l.text.trim() !== "")
-    .slice(-10)
-    .map(l => ({ role: l.role, text: l.text.length > 300 ? `${l.text.slice(0, 300)}…` : l.text }));
+  // Already-processed context for pronoun resolution: the shared rolling
+  // window over the sub-thread of events at or below the watermark.
+  const recentContext = deps.store.recentWindow(
+    { ...thread, events: thread.events.filter(e => e.seq <= thread.extractedSeq) },
+    10,
+    300,
+  );
 
   // Phase 1 — existing memories, integer-ref indirection kept host-side.
   const query = newMessages.map(m => m.text).join("\n").slice(0, 2000);

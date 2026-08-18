@@ -5,7 +5,7 @@
 - **[12-factor-agents]** — the agent is a *stateless reducer* over an append-only event log; one Claude call per step returns one **intent** from a Zod discriminated union; a routing switch decides execute-and-continue vs persist-and-break; approvals replay the recorded step verbatim.
 - **[mem0]** — the archival write path is the V3 phased, **ADD-only extraction pipeline** (temporal grounding, integer-ref indirection, hash dedup in code, append-only history audit, best-effort entity index) and hybrid retrieval scoring (cosine + sigmoid-BM25 + entity boost with crowd penalty).
 - **MemGPT-style tiers, stored the mem0 way** — **Core** blocks the agent self-edits live in every prompt with visible budget pressure; **Recall** is the event log + FTS5; **Archival** is vector BLOBs + FTS5 in the same SQLite file.
-- **[spec-kit]** — a semver'd `constitution.md` referenced (never inlined) with structured gate results; bounded clarification markers; deterministic code gathers facts before LLM judgment; CLAUDE.md managed regions hold pointers, not copies.
+- **[spec-kit]** — a semver'd `constitution.md` referenced (never inlined); a structured gate-results module (`{principle, pass, justification?}` — pipeline wiring is roadmap); bounded clarification markers; deterministic code gathers facts before LLM judgment; CLAUDE.md managed regions hold pointers, not copies.
 - **[BMAD-METHOD]** — specialist agents as data with scoped intent unions; subagents run on fresh threads and return only `{verdict, summary, ref}` while full output stays in the child thread.
 - **[bun]** — `bun:sqlite` (WAL, FTS5, transactions), UUIDv7 sortable ids, xxHash64 content fingerprints, and the layered CLAUDE.md/AGENTS.md context-engineering shape.
 
@@ -52,7 +52,7 @@ curl -X POST :7749/threads/<id>/response \
 
 Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, the extraction pipeline with provenance + linking, hybrid scoring, entity index, durable sleep + scheduler, subagent spawn, HTTP pause/resume, CLI channel.
 
-Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out, prompt-eval suite against the live model.
+Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), wiring constitution-gate evaluation into a planning phase, SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out, prompt-eval suite against the live model.
 
 ## Architecture
 

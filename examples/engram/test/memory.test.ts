@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { testWorld } from "./harness";
 import { EntityIndex, extractEntities } from "../src/memory/entities";
+import { scoreAndRank } from "../src/memory/scoring";
 import { buildScopeKey, stripIdentityKeys } from "../src/memory/recall";
 
 const SCOPE = { userId: "u1", agentId: "engram", runId: "" };
@@ -58,10 +59,79 @@ describe("archival tier", () => {
     const hits = await deps.archival.search({ query: "dog named Poppy", scope: SCOPE, explain: true });
     expect(hits.length).toBeGreaterThan(0);
     expect(hits[0]!.payload.content).toContain("Poppy");
-    expect(hits[0]!.scoreDetails).toBeDefined();
-    expect(hits[0]!.scoreDetails!.maxPossibleScore).toBeGreaterThanOrEqual(1);
+    // All three signals are active for this query (semantic + BM25 + entity),
+    // so the adaptive divisor must be exactly 1.0 + 1.0 + 0.5.
+    expect(hits[0]!.scoreDetails!.maxPossibleScore).toBe(2.5);
+    expect(hits[0]!.scoreDetails!.entityBoost).toBeGreaterThan(0);
   });
 
+  test("ranking orders candidates by combined score, best first", async () => {
+    const { deps } = testWorld();
+    await deps.archival.insert({ content: "dog naps daily", scope: SCOPE });
+    await deps.archival.insert({ content: "User's dog Poppy loves long walks", scope: SCOPE });
+    const hits = await deps.archival.search({ query: "dog Poppy walks", scope: SCOPE });
+    expect(hits.length).toBe(2);
+    expect(hits[0]!.payload.content).toContain("Poppy");
+    expect(hits[1]!.payload.content).toContain("naps");
+    expect(hits[0]!.score).toBeGreaterThan(hits[1]!.score);
+  });
+
+  test("keyword/entity boosts never resurrect a semantically gated-out candidate", async () => {
+    const { deps } = testWorld();
+    // One shared token ("Poppy") out of many: cosine ~0.25 < the 0.3 gate,
+    // while FTS matches the keyword squarely.
+    await deps.archival.insert({
+      content:
+        "Poppy quietly wandered around seventeen distant meadows yesterday while gentle breezes carried autumn fragrances toward remote villages",
+      scope: SCOPE,
+    });
+    const hits = await deps.archival.search({ query: "Poppy", scope: SCOPE });
+    expect(hits).toEqual([]);
+  });
+});
+
+describe("scoreAndRank unit guarantees (mem0 semantics)", () => {
+  const payload = {};
+
+  test("threshold gates semantic score BEFORE boosts are added", () => {
+    const ranked = scoreAndRank(
+      [{ id: "gated", score: 0.2, payload }],
+      { gated: 0.9 },
+      { gated: 0.5 },
+      0.3,
+      10,
+    );
+    expect(ranked).toEqual([]);
+  });
+
+  test("scores combine additively and rank descending", () => {
+    const ranked = scoreAndRank(
+      [
+        { id: "a", score: 0.5, payload },
+        { id: "b", score: 0.4, payload },
+      ],
+      { a: 0.1, b: 0.9 },
+      {},
+      0.3,
+      10,
+    );
+    // maxPossible = 2.0 (semantic + bm25): a = 0.6/2, b = 1.3/2.
+    expect(ranked.map(r => r.id)).toEqual(["b", "a"]);
+    expect(ranked[0]!.score).toBeCloseTo(0.65, 5);
+    expect(ranked[1]!.score).toBeCloseTo(0.3, 5);
+  });
+
+  test("the divisor adapts to which signals are active", () => {
+    const semanticOnly = scoreAndRank([{ id: "x", score: 0.8, payload }], {}, {}, 0.3, 1, true);
+    expect(semanticOnly[0]!.scoreDetails!.maxPossibleScore).toBe(1.0);
+    const withBm25 = scoreAndRank([{ id: "x", score: 0.8, payload }], { x: 0.5 }, {}, 0.3, 1, true);
+    expect(withBm25[0]!.scoreDetails!.maxPossibleScore).toBe(2.0);
+    const withBoth = scoreAndRank([{ id: "x", score: 0.8, payload }], { x: 0.5 }, { x: 0.2 }, 0.3, 1, true);
+    expect(withBoth[0]!.scoreDetails!.maxPossibleScore).toBe(2.5);
+  });
+});
+
+describe("archival tier: mutations and read filters", () => {
   test("degraded mode (no embedder) still finds memories via FTS", async () => {
     const { deps } = testWorld({ embedder: false });
     await deps.archival.insert({ content: "User's favorite editor is Neovim with a custom config.", scope: SCOPE });

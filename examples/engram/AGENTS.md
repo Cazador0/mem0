@@ -36,7 +36,7 @@ test("my scenario", async () => {
 });
 ```
 
-The `ScriptedLLM` validates every scripted item against the schema the caller requested, so a drifted fixture fails loudly. A `{ __throw: "msg" }` item makes the next call throw an `LLMError`.
+The `ScriptedLLM` validates every scripted item against the schema the caller requested. A `{ __throw: "msg" }` item makes the next call throw an `LLMError`. **Caveat**: inside `agentLoop`, LLM failures become `error` events by design — so a drifted fixture in a loop-driven test surfaces as a swallowed error event, not a test failure. Loop-driven happy-path tests must therefore also assert `finished.events.filter(e => e.type === "error")` is empty and (where fixture order matters) that `llm.calls` consumed what the comment claims.
 
 ## Architecture map
 
@@ -57,7 +57,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/agent/render.ts` | THE context seam: only place deciding what the model sees |
 | `src/agent/llm.ts` | Anthropic wrapper: schema-validated output, refusal handling, retries |
 | `src/agents/registry.ts` | Specialist agents as data (persona + intent subset) |
-| `src/orchestration/` | Constitution loading + gate evaluation; durable-sleep scheduler |
+| `src/orchestration/` | Constitution loading + gate-evaluation module (pipeline wiring: roadmap); durable-sleep scheduler |
 | `src/server/routes.ts` | Launch/pause/resume over HTTP; resume validated against derived status |
 
 ## Do NOT

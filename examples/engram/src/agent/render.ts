@@ -19,13 +19,15 @@ export function renderEvent(event: ThreadEvent): string {
   const record = data as Record<string, unknown>;
   const tag = typeof record.intent === "string" ? record.intent : event.type;
   const lines: string[] = [];
-  for (const [key, value] of Object.entries(record)) {
+  // Sanitize the whole record so id/ids keys are dropped at EVERY level —
+  // including top-level keys like a memory_write event's `ids`.
+  for (const [key, value] of Object.entries(sanitizeForPrompt(record) as Record<string, unknown>)) {
     if (key === "intent") continue;
     const rendered = SECRET_KEY.test(key)
       ? "[redacted]"
       : typeof value === "string"
         ? redactText(value)
-        : redactText(JSON.stringify(sanitizeForPrompt(value)));
+        : redactText(JSON.stringify(value));
     lines.push(`${key}: ${rendered}`);
   }
   return `<${tag}>\n${lines.join("\n")}\n</${tag}>`;

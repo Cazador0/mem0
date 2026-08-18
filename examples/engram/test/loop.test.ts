@@ -34,6 +34,8 @@ describe("agent loop (stateless reducer)", () => {
     expect(memories.length).toBe(1);
     expect(awaitingHumanResponse(finished)).toBe(true);
     expect(deriveStatus(finished)).toBe("awaiting_human");
+    // No fixture drift silently swallowed as error events.
+    expect(finished.events.filter(e => e.type === "error")).toEqual([]);
   });
 
   test("gated memory_delete breaks for approval; approval replays the recorded step verbatim", async () => {
@@ -125,15 +127,17 @@ describe("agent loop (stateless reducer)", () => {
     expect((last as { message: string }).message).toContain("Step budget");
   });
 
-  test("spawn_subagent runs a scoped child thread and returns only a bounded summary", async () => {
-    // Script items are consumed in call order: parent selects spawn_subagent,
-    // the child selects complete_task, the child's terminal triggers a
-    // procedural summarization call, then the parent yields.
-    const { deps: world } = testWorld({
+  test("spawn_subagent runs a scoped child that summarizes its run procedurally", async () => {
+    // Script items are consumed in call order: parent selects spawn_subagent;
+    // the child searches (a sync step, so its thread crosses summarizeRun's
+    // 3-event minimum), then completes; the terminal triggers the procedural
+    // summarization call; finally the parent yields.
+    const { deps: world, llm } = testWorld({
       script: [
         step({ intent: "spawn_subagent", agent_id: "curator", task: "Review archival memory for duplicates." }),
+        step({ intent: "archival_search", query: "duplicates review" }),
         step({ intent: "complete_task", outcome: "success", summary: "No duplicates found." }),
-        { summary: "Task: review duplicates. Outcome: none found." },
+        { summary: "Reviewed archival memory for duplicates; none were found." },
         step({ intent: "done_for_now", message: "Curator ran." }),
       ],
     });
@@ -151,6 +155,19 @@ describe("agent loop (stateless reducer)", () => {
     const child = world.store.getThread(response.ref);
     expect(child.agentId).toBe("curator");
     expect(deriveStatus(child)).toBe("completed");
+
+    // The procedural fixture must actually be consumed by summarizeRun — a
+    // swallowed fixture would surface as an error event instead.
+    expect(llm.calls).toContain("procedural_summary");
+    expect(finished.events.filter(e => e.type === "error")).toEqual([]);
+    expect(child.events.filter(e => e.type === "error")).toEqual([]);
+    const procedural = await world.archival.search({
+      query: "reviewed archival duplicates",
+      scope: { userId: "u1", agentId: "curator" },
+      memoryType: "procedural",
+    });
+    expect(procedural.length).toBe(1);
+    expect(procedural[0]!.payload.content).toContain("none were found");
   });
 
   test("sleep_until writes a durable schedule; the tick wakes the thread exactly once", async () => {

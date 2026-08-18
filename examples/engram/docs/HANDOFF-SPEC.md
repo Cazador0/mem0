@@ -24,7 +24,7 @@ merging dynamic graph-state workflows with persistent, tiered core/archival memo
 | 12-factor-agents | Stateless reducer `agentLoop(thread) → thread'`; append-only Event log unifying execution+business state; one LLM call → one intent from a Zod discriminated union; two-switch split (route vs execute); derived-status predicates over the log tail; compact errors with counter-gated escalation (3 consecutive → human); pre-fetch memory deterministically instead of offering a fetch tool; pause/resume by thread id from any channel |
 | MemGPT concept, stored the mem0 way | Core tier: named, char-budgeted, self-editable blocks rendered into every system prompt with visible budget pressure; memory edits are sync intents so the loop chains them without a human turn (heartbeat) |
 | mem0 (V3 pipeline) | ADD-only extraction (one LLM call, Observation-Date temporal grounding, integer-ID indirection, rich-not-atomic 15–80-word memories, no-fabrication/no-echo rules), xxHash64 code-side dedup, insert with per-item fallback, append-only history audit table, entity side-index with crowd-penalty boost, hybrid scoring with semantic-threshold gating *before* boosting, scope keys entering payloads in exactly one function, identity-key stripping at write entries, expiration filtered at read time, procedural memory via verbatim-preserving run summarization; ADD/UPDATE/DELETE/NONE reconciliation survives **only** as an offline, audited, approval-gated compaction job *(roadmap)* |
-| spec-kit | `constitution.md` (semver + ratified/amended dates) rendered as a read-only core block; structured gate results `{principle, pass, justification?}` — unjustified failure is an ERROR; `needs_clarification` intent with max-3 impact-ranked markers and recommended-option quick replies; deterministic code gathers facts before any LLM judgment; CLAUDE.md managed region between markers that points at live state |
+| spec-kit | `constitution.md` (semver + ratified/amended dates) rendered as a read-only core block; structured gate results `{principle, pass, justification?}` — unjustified failure is an ERROR *(evaluation module built; wiring into a planning phase is roadmap)*; `needs_clarification` intent with max-3 impact-ranked markers and recommended-option quick replies; deterministic code gathers facts before any LLM judgment; CLAUDE.md managed region between markers that points at live state |
 | BMAD-METHOD | Specialist agents as **data** `{id, persona, intentUnion subset}`; subagents run on fresh threads, write full output there, and return `{verdict, topFindings, ref}`; CAS state transitions (`UPDATE … WHERE <expected previous state>`); capsule compiler and asymmetric-context review fan-out *(roadmap)* |
 | bun | `bun:sqlite` WAL + strict + prepared statements + immediate transactions; FTS5 for both Recall and Archival keyword legs; UUIDv7 PKs (sortable = free recency); xxHash64 content fingerprints; layered CLAUDE.md with enforced invariants; hermetic test harness |
 
@@ -104,6 +104,9 @@ engram/
 
 ## 7. Roadmap (specified, not yet built)
 
+- **Constitution gate wiring**: a planning intent whose output carries
+  `gate_results`, evaluated by `orchestration/gates.ts` before execution — the
+  evaluation module and its semantics exist; no production path calls it yet.
 - **Offline reconciliation** (`memory/reconcile.ts`): cluster near-duplicates by
   cosine within scope, integer-ID map, ADD/UPDATE/DELETE/NONE prompt (mem0's
   legacy `DEFAULT_UPDATE_MEMORY_PROMPT` design), validate returned IDs, apply in

@@ -49,10 +49,12 @@ export async function executeStep(
         sourceThreadId: thread.id,
         sourceEventSeqs: [callSeq],
       });
+      // Result strings never carry raw memory UUIDs (constitution IV) — the
+      // model addresses memories through search refs only.
       return {
         intent: step.intent,
         ok: true,
-        result: result.created ? `saved memory ${result.id}` : `duplicate — already saved as ${result.id}`,
+        result: result.created ? "memory saved" : "duplicate — this was already saved",
       };
     }
 
