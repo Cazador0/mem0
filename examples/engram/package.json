@@ -1,0 +1,21 @@
+{
+  "name": "engram",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first agentic application with tiered core/recall/archival memory, built on Bun + bun:sqlite + Claude",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "chat": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.4",
+    "typescript": "^5.9.2"
+  }
+}

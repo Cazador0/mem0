@@ -1,0 +1,145 @@
+import type { Database } from "bun:sqlite";
+import { nowIso } from "../db/database";
+
+/**
+ * Core tier: MemGPT-style named, char-budgeted, self-editable blocks that are
+ * rendered into EVERY system prompt. The agent edits them via core_append /
+ * core_replace intents; edits are compare-and-swap guarded on `version` so a
+ * stale concurrent session fails loudly (constitution II). The `constitution`
+ * block is read-only to edit intents.
+ */
+
+export interface CoreBlock {
+  agentId: string;
+  label: string;
+  content: string;
+  charLimit: number;
+  readOnly: boolean;
+  version: number;
+  updatedAt: string;
+}
+
+export interface CoreEditResult {
+  ok: boolean;
+  message: string;
+}
+
+export const DEFAULT_BLOCKS: Array<{ label: string; charLimit: number }> = [
+  { label: "persona", charLimit: 2000 },
+  { label: "human", charLimit: 2000 },
+  { label: "project", charLimit: 3000 },
+  { label: "scratchpad", charLimit: 2000 },
+];
+
+interface CoreBlockRow {
+  agent_id: string;
+  label: string;
+  content: string;
+  char_limit: number;
+  read_only: number;
+  version: number;
+  updated_at: string;
+}
+
+export class CoreMemory {
+  constructor(private readonly db: Database) {}
+
+  /** Idempotently create the standard blocks plus the read-only constitution pointer. */
+  seed(agentId: string, persona: string, constitutionPointer: string): void {
+    const now = nowIso();
+    const insert = this.db.query(
+      `INSERT INTO core_blocks (agent_id, label, content, char_limit, read_only, version, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)
+       ON CONFLICT (agent_id, label) DO NOTHING`,
+    );
+    for (const block of DEFAULT_BLOCKS) {
+      const content = block.label === "persona" ? persona : "";
+      insert.run(agentId, block.label, content, block.charLimit, 0, now);
+    }
+    insert.run(agentId, "constitution", constitutionPointer, 4000, 1, now);
+  }
+
+  get(agentId: string, label: string): CoreBlock | null {
+    const row = this.db
+      .query("SELECT * FROM core_blocks WHERE agent_id = ? AND label = ?")
+      .get(agentId, label) as CoreBlockRow | null;
+    return row ? rowToBlock(row) : null;
+  }
+
+  list(agentId: string): CoreBlock[] {
+    const rows = this.db
+      .query("SELECT * FROM core_blocks WHERE agent_id = ? ORDER BY label")
+      .all(agentId) as CoreBlockRow[];
+    return rows.map(rowToBlock);
+  }
+
+  /**
+   * Render all blocks for the system prompt, each showing its own budget
+   * pressure so the model can manage its context (the MemGPT idea).
+   */
+  render(agentId: string): string {
+    return this.list(agentId)
+      .map(
+        b =>
+          `<core_block label="${b.label}" chars="${b.content.length}/${b.charLimit}"${b.readOnly ? ' read_only="true"' : ""}>\n${b.content}\n</core_block>`,
+      )
+      .join("\n");
+  }
+
+  append(agentId: string, label: string, content: string): CoreEditResult {
+    const block = this.get(agentId, label);
+    if (!block) return { ok: false, message: `no core block "${label}"` };
+    if (block.readOnly) return { ok: false, message: `core block "${label}" is read-only` };
+    const next = block.content ? `${block.content}\n${content}` : content;
+    if (next.length > block.charLimit) {
+      return {
+        ok: false,
+        message: `budget exceeded: "${label}" would be ${next.length}/${block.charLimit} chars — compress it first with core_replace`,
+      };
+    }
+    return this.write(block, next);
+  }
+
+  replace(agentId: string, label: string, oldText: string, newText: string): CoreEditResult {
+    const block = this.get(agentId, label);
+    if (!block) return { ok: false, message: `no core block "${label}"` };
+    if (block.readOnly) return { ok: false, message: `core block "${label}" is read-only` };
+    if (!block.content.includes(oldText)) {
+      return { ok: false, message: `old_text not found in "${label}" — it must match exactly` };
+    }
+    const next = block.content.replace(oldText, newText);
+    if (next.length > block.charLimit) {
+      return {
+        ok: false,
+        message: `budget exceeded: "${label}" would be ${next.length}/${block.charLimit} chars`,
+      };
+    }
+    return this.write(block, next);
+  }
+
+  /** CAS write: bumps version only if nobody else wrote since we read. */
+  private write(block: CoreBlock, content: string): CoreEditResult {
+    const res = this.db
+      .query(
+        `UPDATE core_blocks SET content = ?, version = version + 1, updated_at = ?
+         WHERE agent_id = ? AND label = ? AND version = ?`,
+      )
+      .run(content, nowIso(), block.agentId, block.label, block.version);
+    if (res.changes === 0) {
+      return { ok: false, message: `concurrent edit on "${block.label}" — re-read and retry` };
+    }
+    return { ok: true, message: `updated "${block.label}" (${content.length}/${block.charLimit} chars)` };
+  }
+}
+
+function rowToBlock(row: CoreBlockRow): CoreBlock {
+  return {
+    agentId: row.agent_id,
+    label: row.label,
+    content: row.content,
+    charLimit: row.char_limit,
+    readOnly: row.read_only === 1,
+    version: row.version,
+    updatedAt: row.updated_at,
+  };
+}
