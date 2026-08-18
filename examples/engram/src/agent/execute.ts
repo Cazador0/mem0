@@ -2,8 +2,8 @@ import type { NextStep } from "./intents";
 import {
   buildRefMap,
   deriveStatus,
+  effectiveTail,
   eventAsStep,
-  lastEvent,
   type Thread,
 } from "./thread";
 import type { EngramDeps } from "../deps";
@@ -27,7 +27,7 @@ export async function executeStep(
   extras: ExecuteExtras = {},
 ): Promise<Record<string, unknown>> {
   const scope = { userId: thread.userId, agentId: thread.agentId, runId: thread.runId };
-  const callSeq = lastEvent(thread)?.seq ?? 0;
+  const callSeq = effectiveTail(thread)?.seq ?? 0;
 
   switch (step.intent) {
     case "core_append": {
@@ -120,6 +120,15 @@ export async function executeStep(
       if (!def) {
         return { intent: step.intent, ok: false, result: `unknown agent "${step.agent_id}"` };
       }
+      if (def.intents.includes("spawn_subagent")) {
+        // Recursion guard: an agent that can itself spawn subagents would allow
+        // unbounded synchronous recursion (each level burning a full step budget).
+        return {
+          intent: step.intent,
+          ok: false,
+          result: `refusing to spawn "${step.agent_id}": agents that can spawn subagents cannot be spawned`,
+        };
+      }
       if (!extras.runLoop) {
         return { intent: step.intent, ok: false, result: "subagent execution unavailable in this context" };
       }
@@ -154,7 +163,7 @@ function nextRefFrom(thread: Thread): number {
 }
 
 function subagentSummary(child: Thread): { verdict: string; summary: string } {
-  const last = eventAsStep(lastEvent(child));
+  const last = eventAsStep(effectiveTail(child));
   if (last?.intent === "complete_task") {
     return { verdict: last.outcome, summary: truncate(last.summary, 500) };
   }

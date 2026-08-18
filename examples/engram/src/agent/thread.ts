@@ -52,6 +52,23 @@ export function lastEvent(thread: Thread): ThreadEvent | undefined {
   return thread.events[thread.events.length - 1];
 }
 
+/**
+ * The event that determines a thread's status. Annotation events appended by
+ * background work (memory_write) and by the scheduler (system_note) do not
+ * change what the thread is waiting for, so status derivation skips them —
+ * otherwise a background extraction would flip a paused thread to "idle" and
+ * make it unresumable.
+ */
+const ANNOTATION_TYPES: ReadonlySet<EventType> = new Set(["memory_write", "system_note"]);
+
+export function effectiveTail(thread: Thread): ThreadEvent | undefined {
+  for (let i = thread.events.length - 1; i >= 0; i--) {
+    const event = thread.events[i]!;
+    if (!ANNOTATION_TYPES.has(event.type)) return event;
+  }
+  return undefined;
+}
+
 /** Parse a tool_call event's data as a NextStep, or undefined if malformed. */
 export function eventAsStep(event: ThreadEvent | undefined): NextStep | undefined {
   if (!event || event.type !== "tool_call") return undefined;
@@ -60,12 +77,12 @@ export function eventAsStep(event: ThreadEvent | undefined): NextStep | undefine
 }
 
 export function awaitingApproval(thread: Thread): boolean {
-  const step = eventAsStep(lastEvent(thread));
+  const step = eventAsStep(effectiveTail(thread));
   return step !== undefined && routeIntent(step) === "gated";
 }
 
 export function awaitingHumanResponse(thread: Thread): boolean {
-  const step = eventAsStep(lastEvent(thread));
+  const step = eventAsStep(effectiveTail(thread));
   if (!step) return false;
   return (
     step.intent === "request_human_input" ||
@@ -75,11 +92,11 @@ export function awaitingHumanResponse(thread: Thread): boolean {
 }
 
 export function isSleeping(thread: Thread): boolean {
-  return eventAsStep(lastEvent(thread))?.intent === "sleep_until";
+  return eventAsStep(effectiveTail(thread))?.intent === "sleep_until";
 }
 
 export function isCompleted(thread: Thread): boolean {
-  return eventAsStep(lastEvent(thread))?.intent === "complete_task";
+  return eventAsStep(effectiveTail(thread))?.intent === "complete_task";
 }
 
 export function deriveStatus(thread: Thread): ThreadStatus {
@@ -90,9 +107,24 @@ export function deriveStatus(thread: Thread): ThreadStatus {
   return "idle";
 }
 
-/** Count of LLM-chosen steps so far (factor 10: bound each agent's steps). */
+/** Count of LLM-chosen steps over the thread's whole life (display only). */
 export function stepCount(thread: Thread): number {
   return thread.events.filter(e => e.type === "tool_call").length;
+}
+
+/**
+ * Steps taken in the CURRENT turn — tool_calls after the latest human input.
+ * The loop budget uses this (factor 10) so the budget resets each time the
+ * human speaks; a lifetime count would permanently brick long-lived threads.
+ */
+export function stepsThisTurn(thread: Thread): number {
+  let steps = 0;
+  for (let i = thread.events.length - 1; i >= 0; i--) {
+    const type = thread.events[i]!.type;
+    if (type === "user_input" || type === "human_response") break;
+    if (type === "tool_call") steps++;
+  }
+  return steps;
 }
 
 /** Trailing consecutive error events (factor 9: escalate at ~3). */

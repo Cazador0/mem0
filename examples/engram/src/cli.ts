@@ -9,8 +9,8 @@ import {
   awaitingApproval,
   awaitingHumanResponse,
   deriveStatus,
+  effectiveTail,
   eventAsStep,
-  lastEvent,
 } from "./agent/thread";
 
 /**
@@ -36,7 +36,7 @@ for await (const line of console) {
 
   const current = deps.store.getThread(thread.id);
   if (awaitingApproval(current)) {
-    const recorded = eventAsStep(lastEvent(current));
+    const recorded = eventAsStep(effectiveTail(current));
     const approved = /^y(es)?$/i.test(input);
     if (recorded && approved) {
       const result = await executeStep(recorded, current, deps, { runLoop: id => agentLoop(id, deps) });

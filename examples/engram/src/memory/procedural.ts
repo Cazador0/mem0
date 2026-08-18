@@ -24,9 +24,13 @@ export async function summarizeRun(deps: EngramDeps, thread: Thread): Promise<st
     schemaName: "procedural_summary",
   });
 
+  // Deliberately NOT run-scoped: run ids are unique per run (subagent threads
+  // use the parent thread id), so a run-scoped summary would never match any
+  // future search. Procedural knowledge is per-agent, cross-run — same as
+  // mem0's procedural memory, which scopes by agent_id.
   await deps.archival.insert({
     content: summary,
-    scope: { userId: thread.userId, agentId: thread.agentId, runId: thread.runId },
+    scope: { userId: thread.userId, agentId: thread.agentId },
     memoryType: "procedural",
     sourceThreadId: thread.id,
   });

@@ -104,10 +104,13 @@ export class CoreMemory {
     const block = this.get(agentId, label);
     if (!block) return { ok: false, message: `no core block "${label}"` };
     if (block.readOnly) return { ok: false, message: `core block "${label}" is read-only` };
-    if (!block.content.includes(oldText)) {
+    const at = block.content.indexOf(oldText);
+    if (at === -1) {
       return { ok: false, message: `old_text not found in "${label}" — it must match exactly` };
     }
-    const next = block.content.replace(oldText, newText);
+    // Manual splice: String.replace would interpret $&/$'/$` patterns in
+    // agent-authored new_text as replacement directives.
+    const next = block.content.slice(0, at) + newText + block.content.slice(at + oldText.length);
     if (next.length > block.charLimit) {
       return {
         ok: false,

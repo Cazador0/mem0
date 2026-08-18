@@ -7,8 +7,8 @@ import {
   awaitingApproval,
   awaitingHumanResponse,
   deriveStatus,
+  effectiveTail,
   eventAsStep,
-  lastEvent,
   stepCount,
   type Thread,
 } from "../agent/thread";
@@ -31,6 +31,30 @@ const ResumeBody = z.discriminatedUnion("type", [
   z.object({ type: z.literal("approval"), approved: z.boolean(), comment: z.string().optional() }),
   z.object({ type: z.literal("response"), response: z.string().min(1) }),
 ]);
+
+/**
+ * Per-thread serialization: Bun.serve handles requests concurrently, and the
+ * approval branch awaits between the derived-status check and the event append
+ * — without a lock, two simultaneous approvals would both pass the check,
+ * execute the recorded step twice, and interleave two loops into one log.
+ */
+const threadLocks = new Map<string, Promise<void>>();
+
+async function withThreadLock<T>(threadId: string, fn: () => Promise<T>): Promise<T> {
+  const previous = threadLocks.get(threadId) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  const chain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  threadLocks.set(threadId, chain);
+  void chain.then(() => {
+    // Drop the entry once the chain we stored has fully settled — a newer
+    // chain replaces it first if more work queued behind us.
+    if (threadLocks.get(threadId) === chain) threadLocks.delete(threadId);
+  });
+  return run;
+}
 
 export function createServer(deps: EngramDeps) {
   return Bun.serve({
@@ -76,7 +100,8 @@ async function route(req: Request, deps: EngramDeps): Promise<Response> {
   }
 
   if (parts[0] === "threads" && parts[2] === "response" && parts.length === 3 && req.method === "POST") {
-    return resumeThread(parts[1]!, await req.json(), deps);
+    const body = await req.json();
+    return withThreadLock(parts[1]!, () => resumeThread(parts[1]!, body, deps));
   }
 
   return Response.json({ error: "not found" }, { status: 404 });
@@ -92,7 +117,7 @@ async function resumeThread(threadId: string, rawBody: unknown, deps: EngramDeps
     if (!awaitingApproval(thread)) {
       return badRequest(`thread is ${deriveStatus(thread)}, not awaiting approval`);
     }
-    const recorded = eventAsStep(lastEvent(thread));
+    const recorded = eventAsStep(effectiveTail(thread));
     if (!recorded) return badRequest("recorded step is malformed");
     if (body.data.approved) {
       // Replay the recorded, already-persisted tool_call verbatim (constitution IV).

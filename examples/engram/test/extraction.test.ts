@@ -26,10 +26,35 @@ describe("archival extraction pipeline (mem0 V3, ADD-only)", () => {
     expect(stored.sourceThreadId).toBe(thread.id);
     expect(stored.sourceEventSeqs).toEqual([0]);
 
-    // The write is recorded in the thread and the watermark advanced past it.
+    // The write is recorded in the thread; the watermark covers ONLY the
+    // Phase-0 snapshot (seq 0) — events appended during extraction (including
+    // the memory_write itself) stay above it so they are never skipped.
     const reloaded = deps.store.getThread(thread.id);
     expect(reloaded.events.some(e => e.type === "memory_write")).toBe(true);
-    expect(reloaded.extractedSeq).toBe(reloaded.events[reloaded.events.length - 1]!.seq);
+    expect(reloaded.extractedSeq).toBe(0);
+    expect(reloaded.events[reloaded.events.length - 1]!.seq).toBeGreaterThan(reloaded.extractedSeq);
+  });
+
+  test("watermark never covers conversational events appended during an in-flight extraction", async () => {
+    const { deps } = testWorld({
+      script: [
+        { memories: [{ text: "User's dog is named Rex.", linked_refs: [] }] },
+        { memories: [{ text: "User's cat is named Whiskers.", linked_refs: [] }] },
+      ],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "My dog is named Rex.");
+
+    // Simulate the race: the message that arrives mid-extraction is appended
+    // after the pipeline snapshotted the thread but before it finished.
+    const inFlight = extractFromThread(deps, thread.id);
+    deps.store.appendEvent(thread.id, "user_input", "Also my cat is named Whiskers.");
+    await inFlight;
+
+    // The cat message is still above the watermark, so the next run extracts it.
+    const second = await extractFromThread(deps, thread.id);
+    expect(second.added.length).toBe(1);
+    expect(second.added[0]!.memory).toContain("Whiskers");
   });
 
   test("no new messages -> early return without an LLM call", async () => {

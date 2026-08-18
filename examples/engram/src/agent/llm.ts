@@ -128,14 +128,27 @@ function textOf(response: Anthropic.Message): string {
     .join("");
 }
 
-/** Salvage parser (mem0's extract_json pattern): strip fences, slice outermost braces. */
+/**
+ * Salvage parser (mem0's extract_json pattern). Raw parse first — string
+ * values may legitimately contain code fences, so global fence-stripping would
+ * corrupt them. Only if raw parse fails: strip fences anchored at the start
+ * and end of the reply, then slice the outermost braces.
+ */
 export function extractJson(text: string): unknown | null {
-  const stripped = text.replace(/```(?:json)?/g, "").trim();
-  const start = stripped.indexOf("{");
-  const end = stripped.lastIndexOf("}");
+  const trimmed = text.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // fall through to salvage
+  }
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "");
+  const start = unfenced.indexOf("{");
+  const end = unfenced.lastIndexOf("}");
   if (start === -1 || end <= start) return null;
   try {
-    return JSON.parse(stripped.slice(start, end + 1));
+    return JSON.parse(unfenced.slice(start, end + 1));
   } catch {
     return null;
   }

@@ -1,12 +1,14 @@
 import { nowIso } from "../db/database";
 import type { EngramDeps } from "../deps";
-import type { Thread } from "../agent/thread";
+import { isSleeping, type Thread } from "../agent/thread";
 
 /**
  * Durable sleep (12-factor factor 6 + heartbeat): sleep_until writes a
  * schedules row; a minutely tick claims due rows with a compare-and-swap
  * (UPDATE ... WHERE fired = 0 — BMAD's expected-previous-state rule) and
- * re-enters the loop. Wakes survive restarts because the rows do.
+ * re-enters the loop. Pending wakes survive restarts because the rows do;
+ * delivery is at-most-once — a crash in the window between the claim and the
+ * wake event loses that wake (a lease + startup reset is roadmap).
  */
 export function scheduleWake(deps: EngramDeps, threadId: string, wakeAt: string, note: string): void {
   deps.db
@@ -31,6 +33,12 @@ export async function tickScheduler(
       .query("UPDATE schedules SET fired = 1 WHERE id = ? AND fired = 0")
       .run(row.id);
     if (claimed.changes === 0) continue; // another ticker claimed it
+
+    // A stale wake: the thread moved on (user superseded the sleep, task
+    // completed). Consume the row without disturbing the thread.
+    const thread = deps.store.getThread(row.thread_id);
+    if (!isSleeping(thread)) continue;
+
     fired++;
     deps.store.appendEvent(row.thread_id, "system_note", {
       note: `Woke from scheduled sleep: ${row.note}`,

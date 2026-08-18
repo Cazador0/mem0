@@ -1,4 +1,4 @@
-import { eventAsStep, lastEvent, type Thread, type ThreadEvent } from "./thread";
+import { effectiveTail, eventAsStep, type Thread, type ThreadEvent } from "./thread";
 
 /**
  * renderContext — THE seam (12-factor factor 3): the only place that decides
@@ -24,11 +24,29 @@ export function renderEvent(event: ThreadEvent): string {
     const rendered = SECRET_KEY.test(key)
       ? "[redacted]"
       : typeof value === "string"
-        ? value
-        : JSON.stringify(value);
+        ? redactText(value)
+        : redactText(JSON.stringify(sanitizeForPrompt(value)));
     lines.push(`${key}: ${rendered}`);
   }
   return `<${tag}>\n${lines.join("\n")}\n</${tag}>`;
+}
+
+/**
+ * Read-side stripping of raw memory UUIDs (constitution IV: the model sees
+ * integer refs only). The canonical event keeps `id` for buildRefMap; the
+ * prompt never does.
+ */
+function sanitizeForPrompt(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeForPrompt);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      if (key === "id" || key === "ids") continue;
+      out[key] = sanitizeForPrompt(v);
+    }
+    return out;
+  }
+  return value;
 }
 
 /**
@@ -77,7 +95,7 @@ export function compactError(err: unknown): string {
 
 /** The human-facing text of a paused/finished thread (presentation only). */
 export function outwardText(thread: Thread): string | null {
-  const step = eventAsStep(lastEvent(thread));
+  const step = eventAsStep(effectiveTail(thread));
   if (!step) return null;
   switch (step.intent) {
     case "done_for_now":

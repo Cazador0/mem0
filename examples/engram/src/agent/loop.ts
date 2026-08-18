@@ -1,5 +1,5 @@
 import { envelopeForIntents, routeIntent, type NextStep } from "./intents";
-import { consecutiveErrors, deriveStatus, stepCount, type Thread } from "./thread";
+import { consecutiveErrors, deriveStatus, stepsThisTurn, type Thread } from "./thread";
 import { executeStep } from "./execute";
 import { compactError, renderUserMessage } from "./render";
 import { buildSystemPrompt } from "../prompts/nextstep";
@@ -21,7 +21,7 @@ export async function agentLoop(threadId: string, deps: EngramDeps): Promise<Thr
   const maxSteps = agent.maxSteps ?? deps.config.maxSteps;
 
   loop: while (true) {
-    if (stepCount(thread) >= maxSteps) {
+    if (stepsThisTurn(thread) >= maxSteps) {
       // Factor 10: bounded agents. Overflow yields with a handoff message.
       deps.store.appendEvent(thread.id, "tool_call", {
         intent: "done_for_now",

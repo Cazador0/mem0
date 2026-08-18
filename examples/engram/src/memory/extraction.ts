@@ -81,16 +81,18 @@ export async function extractFromThread(
     }
   }
 
-  // Phase 8 — record the write in the thread, then advance the watermark past it.
+  // Phase 8 — record the write, then advance the watermark ONLY to the max seq
+  // of the Phase-0 snapshot. Events appended while the LLM call was in flight
+  // were not extracted, so they must stay above the watermark; the memory_write
+  // event itself is non-conversational and is harmless above it.
   if (added.length > 0) {
     deps.store.appendEvent(thread.id, "memory_write", {
       count: added.length,
       ids: added.map(a => a.id),
     });
   }
-  const refreshed = deps.store.getThread(thread.id);
-  const maxSeq = refreshed.events.reduce((max, e) => Math.max(max, e.seq), -1);
-  deps.store.setExtractedSeq(thread.id, maxSeq);
+  const snapshotMaxSeq = thread.events.reduce((max, e) => Math.max(max, e.seq), thread.extractedSeq);
+  deps.store.setExtractedSeq(thread.id, snapshotMaxSeq);
 
   return { added };
 }

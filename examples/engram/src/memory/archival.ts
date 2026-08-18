@@ -142,7 +142,20 @@ export class ArchivalMemory {
         .run(args.content, id);
       this.addHistory(id, null, args.content, "ADD", false);
     });
-    write.immediate();
+    try {
+      write.immediate();
+    } catch (err) {
+      // The dedup SELECT above ran before the embed await; a concurrent insert
+      // of the same content can win that race. Honor the created:false
+      // contract instead of surfacing the UNIQUE violation.
+      if (String((err as Error).message).includes("UNIQUE")) {
+        const winner = this.db
+          .query("SELECT * FROM memories WHERE hash = ? AND user_id = ? AND agent_id = ? AND run_id = ?")
+          .get(hash, scope.userId, scope.agentId, scope.runId) as RawRow | null;
+        if (winner) return { id: winner.id, created: false, memory: rowToRecord(winner) };
+      }
+      throw err;
+    }
 
     // Best-effort side index — never fails the write (constitution VII).
     this.entities.linkMemory(id, args.content, scope);
@@ -173,43 +186,64 @@ export class ArchivalMemory {
     if (rows.length === 0) return [];
 
     const inScope = new Set(rows.map(r => r.id));
-    const bm25Raw = this.bm25Scores(args.query, inScope);
+    const bm25Raw = filterKeys(this.bm25Scores(args.query, scope), inScope);
+    const entityBoosts = filterKeys(this.entities.boostsForQuery(args.query, scope), inScope);
+    const explain = args.explain ?? false;
 
-    let semantic: Array<{ id: string; score: number; payload: MemoryRecord }>;
-    let bm25ForRank: Record<string, number>;
-    let threshold: number;
-
-    if (this.embedder) {
-      const queryVec = await this.embedder.embed(args.query);
-      semantic = rows
-        .filter(r => r.embedding !== null)
-        .map(r => ({
-          id: r.id,
-          score: cosineSimilarity(queryVec, blobToVec(r.embedding as Uint8Array)),
-          payload: rowToRecord(r),
-        }));
-      bm25ForRank = bm25Raw;
-      threshold = SEMANTIC_THRESHOLD;
-    } else {
+    if (!this.embedder) {
       // Degraded mode: the normalized BM25 leg becomes the base signal.
       const byId = new Map(rows.map(r => [r.id, r]));
-      semantic = Object.entries(bm25Raw).map(([id, score]) => ({
+      const semantic = Object.entries(bm25Raw).map(([id, score]) => ({
         id,
         score,
         payload: rowToRecord(byId.get(id)!),
       }));
-      bm25ForRank = {};
-      threshold = DEGRADED_THRESHOLD;
+      return scoreAndRank(semantic, {}, entityBoosts, DEGRADED_THRESHOLD, topK, explain);
     }
 
-    const entityBoosts = filterKeys(this.entities.boostsForQuery(args.query, scope), inScope);
-    return scoreAndRank(semantic, bm25ForRank, entityBoosts, threshold, topK, args.explain ?? false);
+    const queryVec = await this.embedder.embed(args.query);
+    const withVec = rows.filter(r => r.embedding !== null);
+    const withoutVec = rows.filter(r => r.embedding === null);
+    warnOnDimsMismatch(queryVec, withVec);
+
+    const semantic = withVec.map(r => ({
+      id: r.id,
+      score: cosineSimilarity(queryVec, blobToVec(r.embedding as Uint8Array)),
+      payload: rowToRecord(r),
+    }));
+    const primary = scoreAndRank(semantic, bm25Raw, entityBoosts, SEMANTIC_THRESHOLD, topK, explain);
+
+    // Rows stored without a vector (embedding outage, pre-embedder era) must
+    // stay reachable: score them degraded-style on the BM25 leg and merge.
+    const fallback = scoreAndRank(
+      withoutVec
+        .filter(r => (bm25Raw[r.id] ?? 0) > 0)
+        .map(r => ({ id: r.id, score: bm25Raw[r.id]!, payload: rowToRecord(r) })),
+      {},
+      entityBoosts,
+      DEGRADED_THRESHOLD,
+      topK,
+      explain,
+    );
+
+    return [...primary, ...fallback].sort((a, b) => b.score - a.score).slice(0, topK);
   }
 
   /** Rewrite a memory's content: audits before/after, rehashes, re-embeds, relinks entities. */
   async update(id: string, newContent: string, actorId?: string): Promise<{ ok: boolean; message: string }> {
     const row = this.db.query("SELECT * FROM memories WHERE id = ?").get(id) as RawRow | null;
     if (!row) return { ok: false, message: `no memory with id ${id}` };
+
+    const newHash = this.contentHash(newContent);
+    const collision = this.db
+      .query("SELECT id FROM memories WHERE hash = ? AND user_id = ? AND agent_id = ? AND run_id = ? AND id != ?")
+      .get(newHash, row.user_id, row.agent_id, row.run_id, id) as { id: string } | null;
+    if (collision) {
+      return {
+        ok: false,
+        message: `new content duplicates existing memory ${collision.id} — update that one, or delete this one instead`,
+      };
+    }
 
     let embedding: Float32Array | null = null;
     if (this.embedder) {
@@ -223,7 +257,7 @@ export class ArchivalMemory {
       this.addHistory(id, row.content, newContent, "UPDATE", false, actorId);
       this.db
         .query("UPDATE memories SET content = ?, hash = ?, embedding = ?, updated_at = ? WHERE id = ?")
-        .run(newContent, this.contentHash(newContent), embedding ? vecToBlob(embedding) : row.embedding, nowIso(), id);
+        .run(newContent, newHash, embedding ? vecToBlob(embedding) : row.embedding, nowIso(), id);
       this.db.query("DELETE FROM memories_fts WHERE memory_id = ?").run(id);
       this.db.query("INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)").run(newContent, id);
     });
@@ -274,18 +308,32 @@ export class ArchivalMemory {
     }));
   }
 
-  private bm25Scores(query: string, inScope: Set<string>): Record<string, number> {
+  private bm25Scores(
+    query: string,
+    scope: { userId: string; agentId: string; runId: string },
+  ): Record<string, number> {
     const match = ftsMatchExpr(query);
     if (!match) return {};
     const [midpoint, steepness] = getBm25Params(query);
+    // Scope is filtered INSIDE the SQL, and candidates are rank-ordered before
+    // the limit — a global unordered LIMIT would let other scopes starve this
+    // one out of the candidate set entirely.
     const rows = this.db
       .query(
-        "SELECT memory_id, bm25(memories_fts) AS raw FROM memories_fts WHERE memories_fts MATCH ? LIMIT 200",
+        `SELECT f.memory_id AS memory_id, bm25(memories_fts) AS raw
+         FROM memories_fts f
+         JOIN memories m ON m.id = f.memory_id
+         WHERE memories_fts MATCH ?
+           AND m.user_id = ? AND m.agent_id = ? AND m.run_id = ?
+         ORDER BY rank
+         LIMIT 200`,
       )
-      .all(match) as Array<{ memory_id: string; raw: number }>;
+      .all(match, scope.userId, scope.agentId, scope.runId) as Array<{
+      memory_id: string;
+      raw: number;
+    }>;
     const out: Record<string, number> = {};
     for (const row of rows) {
-      if (!inScope.has(row.memory_id)) continue;
       // FTS5 bm25() returns negative values where lower = better; flip sign.
       out[row.memory_id] = normalizeBm25(-row.raw, midpoint, steepness);
     }
@@ -363,4 +411,26 @@ function filterKeys(map: Record<string, number>, allowed: Set<string>): Record<s
     if (allowed.has(key)) out[key] = value;
   }
   return out;
+}
+
+let warnedDimsMismatch = false;
+
+/**
+ * A changed embedding model/dims makes every stored vector cosine to 0, which
+ * the threshold gate then silently discards — surface it loudly, once.
+ */
+function warnOnDimsMismatch(queryVec: Float32Array, rows: RawRow[]): void {
+  if (warnedDimsMismatch) return;
+  for (const row of rows) {
+    const stored = blobToVec(row.embedding as Uint8Array);
+    if (stored.length !== queryVec.length) {
+      warnedDimsMismatch = true;
+      console.warn(
+        `[engram] embedding dims mismatch: stored vectors have ${stored.length} dims but the ` +
+          `configured embedder returns ${queryVec.length} — stored memories will score 0 semantically. ` +
+          `Re-embed the store or restore the original ENGRAM_EMBEDDINGS_MODEL/_DIMS.`,
+      );
+      return;
+    }
+  }
 }
