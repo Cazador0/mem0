@@ -1,10 +1,31 @@
 import { describe, expect, test } from "bun:test";
-import { testWorld } from "./harness";
+import { FakeEmbedder, testWorld } from "./harness";
+import { closeDb, openDb } from "../src/db/database";
+import { ArchivalMemory } from "../src/memory/archival";
 import { EntityIndex, extractEntities } from "../src/memory/entities";
-import { scoreAndRank } from "../src/memory/scoring";
+import { crowdPenalty, ENTITY_BOOST_WEIGHT, getBm25Params, scoreAndRank } from "../src/memory/scoring";
 import { buildScopeKey, stripIdentityKeys } from "../src/memory/recall";
 
 const SCOPE = { userId: "u1", agentId: "engram", runId: "" };
+
+/** A FakeEmbedder with a failure toggle, for outage-path tests. */
+class FlakyEmbedder extends FakeEmbedder {
+  fail = false;
+  override async embed(text: string): Promise<Float32Array> {
+    if (this.fail) throw new Error("embedding endpoint down");
+    return super.embed(text);
+  }
+}
+
+describe("database bootstrap", () => {
+  test("openDb probes FTS5 at startup; closeDb checkpoints and closes", () => {
+    const db = openDb(":memory:");
+    // Reaching this line means the startup FTS5 probe passed (constitution VII
+    // capability detection); on a build without FTS5 openDb throws a named error.
+    closeDb(db); // checkpoint + close must not throw
+    expect(() => db.query("SELECT 1").get()).toThrow(); // really closed
+  });
+});
 
 describe("core tier", () => {
   test("seeds default blocks plus a read-only constitution pointer", () => {
@@ -129,6 +150,19 @@ describe("scoreAndRank unit guarantees (mem0 semantics)", () => {
     const withBoth = scoreAndRank([{ id: "x", score: 0.8, payload }], { x: 0.5 }, { x: 0.2 }, 0.3, 1, true);
     expect(withBoth[0]!.scoreDetails!.maxPossibleScore).toBe(2.5);
   });
+
+  test("mem0-ported constants are pinned: sigmoid table, crowd penalty, entity weight", () => {
+    // Query-length-adaptive sigmoid parameters (mem0/utils/scoring.py table).
+    expect(getBm25Params("one two")).toEqual([5.0, 0.7]);
+    expect(getBm25Params("a b c d e")).toEqual([7.0, 0.6]);
+    expect(getBm25Params("a b c d e f g h")).toEqual([9.0, 0.5]);
+    expect(getBm25Params(Array(12).fill("w").join(" "))).toEqual([10.0, 0.5]);
+    expect(getBm25Params(Array(20).fill("w").join(" "))).toEqual([12.0, 0.5]);
+    // Hub-entity damping: 1/(1+0.001*(n-1)^2).
+    expect(crowdPenalty(1)).toBe(1.0);
+    expect(crowdPenalty(11)).toBeCloseTo(1 / 1.1, 10);
+    expect(ENTITY_BOOST_WEIGHT).toBe(0.5);
+  });
 });
 
 describe("archival tier: mutations and read filters", () => {
@@ -167,6 +201,57 @@ describe("archival tier: mutations and read filters", () => {
     await deps.archival.insert({ content: "User speaks fluent Portuguese.", scope: SCOPE });
     const otherScope = await deps.archival.search({ query: "portuguese", scope: { userId: "someone-else" } });
     expect(otherScope).toEqual([]);
+  });
+
+  test("reads filter only on supplied scope keys: other agents' threads see the user's memories", async () => {
+    const { deps } = testWorld();
+    // Written from an engram thread's identity, as executeStep/extraction do.
+    await deps.archival.insert({ content: "User's favorite color is teal.", scope: SCOPE });
+
+    // A user-scoped read (what archival_search now passes) sees it regardless
+    // of the reading thread's own agent/run identity.
+    const userWide = await deps.archival.search({ query: "favorite color teal", scope: { userId: "u1" } });
+    expect(userWide.length).toBe(1);
+
+    // Supplying a key still restricts — subset semantics, never wildcard.
+    const wrongAgent = await deps.archival.search({
+      query: "favorite color teal",
+      scope: { userId: "u1", agentId: "curator" },
+    });
+    expect(wrongAgent).toEqual([]);
+
+    // And "" is an exact value, not a wildcard: anonymous stays anonymous.
+    const emptyUser = await deps.archival.search({ query: "favorite color teal", scope: { userId: "" } });
+    expect(emptyUser).toEqual([]);
+  });
+
+  test("update stores NULL embedding on re-embed failure so the NEW content stays findable", async () => {
+    const { deps } = testWorld();
+    const flaky = new FlakyEmbedder();
+    const archival = new ArchivalMemory(deps.db, flaky);
+    const { id } = await archival.insert({ content: "User lives in Austin.", scope: SCOPE });
+
+    flaky.fail = true;
+    expect((await archival.update(id, "User lives in Denver as of June 2026.")).ok).toBe(true);
+    flaky.fail = false;
+
+    // Reachable by its new content via the NULL-embedding BM25 fallback…
+    const byNew = await archival.search({ query: "Denver", scope: SCOPE });
+    expect(byNew.map(h => h.payload.content)).toEqual(["User lives in Denver as of June 2026."]);
+    // …and the stale Austin vector no longer routes old-content queries to it.
+    expect(await archival.search({ query: "Austin", scope: SCOPE })).toEqual([]);
+  });
+
+  test("search degrades to keyword scoring when the query embed fails", async () => {
+    const { deps } = testWorld();
+    const flaky = new FlakyEmbedder();
+    const archival = new ArchivalMemory(deps.db, flaky);
+    await archival.insert({ content: "User's favorite editor is Neovim with a custom config.", scope: SCOPE });
+
+    flaky.fail = true;
+    const hits = await archival.search({ query: "neovim editor", scope: SCOPE });
+    expect(hits.length).toBe(1);
+    expect(hits[0]!.payload.content).toContain("Neovim");
   });
 
   test("expired memories are filtered at read time", async () => {

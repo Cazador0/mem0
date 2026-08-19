@@ -1,5 +1,6 @@
 import type { EngramDeps } from "../deps";
 import { conversationalText } from "./recall";
+import { withThreadLock } from "../orchestration/lock";
 import { buildExtractionUser, EXTRACTION_SYSTEM, ExtractionSchema } from "../prompts/extraction";
 
 /**
@@ -17,6 +18,19 @@ import { buildExtractionUser, EXTRACTION_SYSTEM, ExtractionSchema } from "../pro
  * Phase 8: memory_write event + watermark advance
  */
 export async function extractFromThread(
+  deps: EngramDeps,
+  threadId: string,
+): Promise<{ added: Array<{ id: string; memory: string }> }> {
+  // Serialized per thread under a dedicated "extract:" lock namespace: two
+  // background extractions must never snapshot the same watermark (the second
+  // would re-process the first's messages and could regress extracted_seq).
+  // A separate namespace so a multi-second extraction LLM call never blocks
+  // user-facing loop entries, which hold the plain thread-id lock — concurrent
+  // loop appends are safe against a running extraction by snapshot semantics.
+  return withThreadLock(`extract:${threadId}`, () => extractLocked(deps, threadId));
+}
+
+async function extractLocked(
   deps: EngramDeps,
   threadId: string,
 ): Promise<{ added: Array<{ id: string; memory: string }> }> {
@@ -41,9 +55,11 @@ export async function extractFromThread(
   );
 
   // Phase 1 — existing memories, integer-ref indirection kept host-side.
+  // User-scoped read (mem0's sharing model): dedup/linking context must span
+  // every agent's writes for this user, not just this thread's identity.
   const query = newMessages.map(m => m.text).join("\n").slice(0, 2000);
   const existing = await deps.archival
-    .search({ query, scope, topK: 10 })
+    .search({ query, scope: { userId: thread.userId }, topK: 10 })
     .catch(() => []);
   const refToId = new Map(existing.map((hit, i) => [i + 1, hit.id]));
 
@@ -53,7 +69,7 @@ export async function extractFromThread(
     user: buildExtractionUser({
       recentContext,
       existingMemories: existing.map((hit, i) => ({ ref: i + 1, text: hit.payload.content })),
-      newMessages: newMessages.map(m => ({ role: m.role, text: m.text })),
+      newMessages: newMessages.map(m => ({ role: m.role, text: m.text, date: m.ts.slice(0, 10) })),
       observationDate: newMessages[0]!.ts.slice(0, 10),
       currentDate: new Date().toISOString().slice(0, 10),
     }),

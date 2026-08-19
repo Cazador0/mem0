@@ -13,7 +13,7 @@ import type { EngramDeps } from "../deps";
  * pure execution of an already-chosen, already-recorded intent. Returns the
  * tool_response payload; the caller appends it as an event. Because the chosen
  * tool_call is persisted before execution, approval replays the recorded step
- * verbatim (server resume calls this directly with lastEvent's data).
+ * verbatim (server resume calls this directly with the effective tail's data).
  */
 export interface ExecuteExtras {
   /** Injected by the loop so subagents can run without a circular import. */
@@ -59,9 +59,12 @@ export async function executeStep(
     }
 
     case "archival_search": {
+      // Reads are user-scoped (mem0's sharing model): memories belong to the
+      // user, so a curator thread — whose own identity is agent_id "curator" —
+      // sees what engram threads wrote. Writes keep the full thread identity.
       const hits = await deps.archival.search({
         query: step.query,
-        scope,
+        scope: { userId: thread.userId },
         topK: step.top_k ?? 5,
         memoryType: step.memory_type,
         explain: step.explain,

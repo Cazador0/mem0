@@ -6,6 +6,7 @@ import { extractFromThread } from "./memory/extraction";
 import { startScheduler } from "./orchestration/scheduler";
 import { withThreadLock } from "./orchestration/lock";
 import { outwardText } from "./agent/render";
+import { classifyApprovalReply } from "./agent/approval";
 import {
   awaitingApproval,
   awaitingHumanResponse,
@@ -28,9 +29,6 @@ const thread = deps.store.createThread("engram", { userId, agentId: "engram" });
 console.log(`engram chat — thread ${thread.id} (model ${config.model}). Type a message; Ctrl+C to exit.\n`);
 process.stdout.write("> ");
 
-const APPROVE = /^(y|yes|yep|yeah|approve|approved|ok|okay|sure|go ahead)\b/i;
-const DENY = /^(n|no|nope|deny|denied|reject|rejected|stop|cancel)\b/i;
-
 for await (const line of console) {
   const input = line.trim();
   if (!input) {
@@ -45,10 +43,11 @@ for await (const line of console) {
     if (awaitingApproval(current)) {
       const recorded = eventAsStep(effectiveTail(current));
       if (!recorded) return true;
-      if (APPROVE.test(input)) {
+      const reply = classifyApprovalReply(input);
+      if (reply === "approve") {
         const result = await executeStep(recorded, current, deps, { runLoop: id => agentLoop(id, deps) });
         deps.store.appendEvent(thread.id, "tool_response", { ...result, via_human: true });
-      } else if (DENY.test(input)) {
+      } else if (reply === "deny") {
         deps.store.appendEvent(thread.id, "tool_response", {
           intent: recorded.intent,
           ok: false,

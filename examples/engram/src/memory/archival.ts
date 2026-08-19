@@ -170,38 +170,52 @@ export class ArchivalMemory {
     return row ? rowToRecord(row) : null;
   }
 
-  /** Hybrid search: cosine (when an embedder exists) + sigmoid-BM25 + entity boost. */
+  /**
+   * Hybrid search: cosine (when an embedder exists) + sigmoid-BM25 + entity boost.
+   *
+   * Read-side scope follows mem0's semantics: filter only on the identity keys
+   * the caller SUPPLIES (undefined = any; a supplied value — including "" — must
+   * match exactly, so anonymous scopes never wildcard). This is what lets a
+   * curator thread, whose own identity is agent_id "curator", see the user's
+   * memories written from engram threads. Write-side dedup stays exact on all
+   * three columns — storage scope is the writer's identity.
+   */
   async search(args: SearchArgs): Promise<ScoredMemory[]> {
-    const scope = normalizeScope(args.scope);
     const topK = args.topK ?? 5;
+    const { where, params } = scopeFilter(args.scope);
     const rows = (
       this.db
         .query(
           `SELECT * FROM memories
-           WHERE user_id = ? AND agent_id = ? AND run_id = ?
+           WHERE ${where}
              AND (? = '' OR memory_type = ?)`,
         )
-        .all(scope.userId, scope.agentId, scope.runId, args.memoryType ?? "", args.memoryType ?? "") as RawRow[]
+        .all(...params, args.memoryType ?? "", args.memoryType ?? "") as RawRow[]
     ).filter(row => args.showExpired || !isExpired(row));
     if (rows.length === 0) return [];
 
     const inScope = new Set(rows.map(r => r.id));
-    const bm25Raw = filterKeys(this.bm25Scores(args.query, scope), inScope);
-    const entityBoosts = filterKeys(this.entities.boostsForQuery(args.query, scope), inScope);
+    const bm25Raw = filterKeys(this.bm25Scores(args.query, args.scope), inScope);
+    const entityBoosts = filterKeys(this.entities.boostsForQuery(args.query, args.scope), inScope);
     const explain = args.explain ?? false;
 
     if (!this.embedder) {
-      // Degraded mode: the normalized BM25 leg becomes the base signal.
-      const byId = new Map(rows.map(r => [r.id, r]));
-      const semantic = Object.entries(bm25Raw).map(([id, score]) => ({
-        id,
-        score,
-        payload: rowToRecord(byId.get(id)!),
-      }));
-      return scoreAndRank(semantic, {}, entityBoosts, DEGRADED_THRESHOLD, topK, explain);
+      return this.degradedResults(rows, bm25Raw, entityBoosts, topK, explain);
     }
 
-    const queryVec = await this.embedder.embed(args.query);
+    let queryVec: Float32Array | null = null;
+    try {
+      queryVec = await this.embedder.embed(args.query);
+    } catch (err) {
+      // A transient embed outage must degrade like every other embed call
+      // site (insert/update warn and continue) — never abort the search.
+      console.warn(
+        `[engram] query embedding failed, degrading to keyword search: ${(err as Error).message}`,
+      );
+    }
+    if (!queryVec) {
+      return this.degradedResults(rows, bm25Raw, entityBoosts, topK, explain);
+    }
     const withVec = rows.filter(r => r.embedding !== null);
     const withoutVec = rows.filter(r => r.embedding === null);
     warnOnDimsMismatch(queryVec, withVec);
@@ -227,6 +241,23 @@ export class ArchivalMemory {
     );
 
     return [...primary, ...fallback].sort((a, b) => b.score - a.score).slice(0, topK);
+  }
+
+  /** No usable query vector: the normalized BM25 leg becomes the base signal. */
+  private degradedResults(
+    rows: RawRow[],
+    bm25Raw: Record<string, number>,
+    entityBoosts: Record<string, number>,
+    topK: number,
+    explain: boolean,
+  ): ScoredMemory[] {
+    const byId = new Map(rows.map(r => [r.id, r]));
+    const semantic = Object.entries(bm25Raw).map(([id, score]) => ({
+      id,
+      score,
+      payload: rowToRecord(byId.get(id)!),
+    }));
+    return scoreAndRank(semantic, {}, entityBoosts, DEGRADED_THRESHOLD, topK, explain);
   }
 
   /** Rewrite a memory's content: audits before/after, rehashes, re-embeds, relinks entities. */
@@ -257,9 +288,12 @@ export class ArchivalMemory {
     }
     const write = this.db.transaction(() => {
       this.addHistory(id, row.content, newContent, "UPDATE", false, actorId);
+      // On re-embed failure store NULL (matching insert()): the old content's
+      // vector would gate the NEW content out semantically while excluding the
+      // row from the NULL-embedding BM25 fallback — unfindable either way.
       this.db
         .query("UPDATE memories SET content = ?, hash = ?, embedding = ?, updated_at = ? WHERE id = ?")
-        .run(newContent, newHash, embedding ? vecToBlob(embedding) : row.embedding, nowIso(), id);
+        .run(newContent, newHash, embedding ? vecToBlob(embedding) : null, nowIso(), id);
       this.db.query("DELETE FROM memories_fts WHERE memory_id = ?").run(id);
       this.db.query("INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)").run(newContent, id);
     });
@@ -323,27 +357,25 @@ export class ArchivalMemory {
     }));
   }
 
-  private bm25Scores(
-    query: string,
-    scope: { userId: string; agentId: string; runId: string },
-  ): Record<string, number> {
+  private bm25Scores(query: string, scope: Scope): Record<string, number> {
     const match = ftsMatchExpr(query);
     if (!match) return {};
     const [midpoint, steepness] = getBm25Params(query);
-    // Scope is filtered INSIDE the SQL, and candidates are rank-ordered before
-    // the limit — a global unordered LIMIT would let other scopes starve this
-    // one out of the candidate set entirely.
+    // Scope is filtered INSIDE the SQL (supplied keys only, matching search()),
+    // and candidates are rank-ordered before the limit — a global unordered
+    // LIMIT would let other scopes starve this one out of the candidate set.
+    const { where, params } = scopeFilter(scope, "m.");
     const rows = this.db
       .query(
         `SELECT f.memory_id AS memory_id, bm25(memories_fts) AS raw
          FROM memories_fts f
          JOIN memories m ON m.id = f.memory_id
          WHERE memories_fts MATCH ?
-           AND m.user_id = ? AND m.agent_id = ? AND m.run_id = ?
+           AND ${where}
          ORDER BY rank
          LIMIT 200`,
       )
-      .all(match, scope.userId, scope.agentId, scope.runId) as Array<{
+      .all(match, ...params) as Array<{
       memory_id: string;
       raw: number;
     }>;
@@ -413,6 +445,29 @@ function normalize(content: string): string {
 
 function normalizeScope(scope: Scope): { userId: string; agentId: string; runId: string } {
   return { userId: scope.userId ?? "", agentId: scope.agentId ?? "", runId: scope.runId ?? "" };
+}
+
+/**
+ * Read-side WHERE fragment over the identity columns: one clause per key the
+ * caller supplied (mem0's subset semantics). undefined = no restriction;
+ * "" restricts to the anonymous value — it never wildcards.
+ */
+function scopeFilter(scope: Scope, prefix = ""): { where: string; params: string[] } {
+  const clauses: string[] = [];
+  const params: string[] = [];
+  if (scope.userId !== undefined) {
+    clauses.push(`${prefix}user_id = ?`);
+    params.push(scope.userId);
+  }
+  if (scope.agentId !== undefined) {
+    clauses.push(`${prefix}agent_id = ?`);
+    params.push(scope.agentId);
+  }
+  if (scope.runId !== undefined) {
+    clauses.push(`${prefix}run_id = ?`);
+    params.push(scope.runId);
+  }
+  return { where: clauses.length > 0 ? clauses.join(" AND ") : "1 = 1", params };
 }
 
 function isExpired(row: RawRow): boolean {

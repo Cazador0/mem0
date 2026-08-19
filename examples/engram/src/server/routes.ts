@@ -10,6 +10,7 @@ import {
   deriveStatus,
   effectiveTail,
   eventAsStep,
+  isSleeping,
   stepCount,
   type Thread,
 } from "../agent/thread";
@@ -25,7 +26,9 @@ import type { EngramDeps } from "../deps";
 const CreateThreadBody = z.object({
   message: z.string().min(1),
   agent_id: z.string().default("engram"),
-  user_id: z.string().default(""),
+  // Required: defaulting to "" would silently merge every anonymous caller
+  // into one shared memory scope. The CLI supplies $USER for the same reason.
+  user_id: z.string().min(1),
 });
 
 const ResumeBody = z.discriminatedUnion("type", [
@@ -125,7 +128,10 @@ async function resumeThread(threadId: string, rawBody: unknown, deps: EngramDeps
       });
     }
   } else {
-    if (!awaitingHumanResponse(thread)) {
+    // A sleeping thread also accepts a response — as an early wake (the CLI
+    // already behaves this way). The human_response supersedes the sleep; the
+    // scheduler's pending wake is consumed as stale by the sleep_seq guard.
+    if (!awaitingHumanResponse(thread) && !isSleeping(thread)) {
       return badRequest(`thread is ${deriveStatus(thread)}, not awaiting a response`);
     }
     deps.store.appendEvent(thread.id, "human_response", { response: body.data.response });

@@ -76,12 +76,18 @@ export class CoreMemory {
   /**
    * Render all blocks for the system prompt, each showing its own budget
    * pressure so the model can manage its context (the MemGPT idea).
+   *
+   * Block content derives from user text (the agent records facts the human
+   * states), so angle brackets are neutralized at render time — read-side
+   * only, same rule as render.ts — so pasted text can never forge a
+   * core_block or close this one and inject system-level instructions.
    */
   render(agentId: string): string {
+    const escape = (text: string) => text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
     return this.list(agentId)
       .map(
         b =>
-          `<core_block label="${b.label}" chars="${b.content.length}/${b.charLimit}"${b.readOnly ? ' read_only="true"' : ""}>\n${b.content}\n</core_block>`,
+          `<core_block label="${b.label}" chars="${b.content.length}/${b.charLimit}"${b.readOnly ? ' read_only="true"' : ""}>\n${escape(b.content)}\n</core_block>`,
       )
       .join("\n");
   }

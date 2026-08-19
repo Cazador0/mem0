@@ -135,7 +135,12 @@ export class RecallStore {
   }
 
   setExtractedSeq(threadId: string, seq: number): void {
-    this.db.query("UPDATE threads SET extracted_seq = ? WHERE id = ?").run(seq, threadId);
+    // Monotonic: an extraction that snapshotted earlier but finished later must
+    // never move the watermark backwards (that would re-process — and
+    // re-charge — messages a completed extraction already covered).
+    this.db
+      .query("UPDATE threads SET extracted_seq = max(extracted_seq, ?) WHERE id = ?")
+      .run(seq, threadId);
   }
 
   /** FTS5 keyword search over a thread's event history (the recall_search intent). */

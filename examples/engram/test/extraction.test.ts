@@ -1,9 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { testWorld } from "./harness";
+import { testWorld, type ScriptedLLM } from "./harness";
 import { extractFromThread } from "../src/memory/extraction";
-import { LLMError } from "../src/agent/llm";
+import { buildExtractionUser } from "../src/prompts/extraction";
+import { LLMError, type StructuredRequest } from "../src/agent/llm";
 
 const SCOPE = { userId: "u1", agentId: "engram" };
+
+/**
+ * Deterministically hold the extraction at its Phase-2 LLM call: returns
+ * { reached, release } so a test can act between the Phase-0 snapshot and the
+ * pipeline's completion. No timers — awaiting the condition, per CLAUDE.md.
+ */
+function gateLlm(llm: ScriptedLLM): { reached: Promise<void>; release: () => void } {
+  let release!: () => void;
+  let markReached!: () => void;
+  const gate = new Promise<void>(r => (release = r));
+  const reached = new Promise<void>(r => (markReached = r));
+  const original = llm.structured.bind(llm);
+  llm.structured = async function <T>(req: StructuredRequest<T>): Promise<T> {
+    markReached();
+    await gate;
+    return original(req);
+  };
+  return { reached, release };
+}
 
 describe("archival extraction pipeline (mem0 V3, ADD-only)", () => {
   test("extracts memories from new conversational events with provenance", async () => {
@@ -36,7 +56,7 @@ describe("archival extraction pipeline (mem0 V3, ADD-only)", () => {
   });
 
   test("watermark never covers conversational events appended during an in-flight extraction", async () => {
-    const { deps } = testWorld({
+    const { deps, llm } = testWorld({
       script: [
         { memories: [{ text: "User's dog is named Rex.", linked_refs: [] }] },
         { memories: [{ text: "User's cat is named Whiskers.", linked_refs: [] }] },
@@ -46,15 +66,86 @@ describe("archival extraction pipeline (mem0 V3, ADD-only)", () => {
     deps.store.appendEvent(thread.id, "user_input", "My dog is named Rex.");
 
     // Simulate the race: the message that arrives mid-extraction is appended
-    // after the pipeline snapshotted the thread but before it finished.
+    // after the pipeline snapshotted the thread (proven by the LLM gate having
+    // been reached) but before it finished.
+    const { reached, release } = gateLlm(llm);
     const inFlight = extractFromThread(deps, thread.id);
+    await reached;
     deps.store.appendEvent(thread.id, "user_input", "Also my cat is named Whiskers.");
+    release();
     await inFlight;
 
     // The cat message is still above the watermark, so the next run extracts it.
     const second = await extractFromThread(deps, thread.id);
     expect(second.added.length).toBe(1);
     expect(second.added[0]!.memory).toContain("Whiskers");
+  });
+
+  test("concurrent extractions on one thread serialize: one LLM call, no duplicates", async () => {
+    const { deps, llm } = testWorld({
+      script: [{ memories: [{ text: "User's dog is named Rex.", linked_refs: [] }] }],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "My dog is named Rex.");
+
+    // Fired without awaiting, exactly as backgroundExtraction does. The second
+    // run queues behind the first on the extraction lock, re-reads the advanced
+    // watermark, and returns empty WITHOUT consuming a script item — an
+    // unserialized second run would exhaust the one-item script and throw.
+    const [first, second] = await Promise.all([
+      extractFromThread(deps, thread.id),
+      extractFromThread(deps, thread.id),
+    ]);
+    expect(first.added.length + second.added.length).toBe(1);
+    expect(llm.calls).toEqual(["extraction"]);
+  });
+
+  test("extraction watermark is monotonic: a stale writer can never move it backwards", () => {
+    const { deps } = testWorld();
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.setExtractedSeq(thread.id, 5);
+    deps.store.setExtractedSeq(thread.id, 3); // an older-snapshot extraction finishing last
+    expect(deps.store.getThread(thread.id).extractedSeq).toBe(5);
+  });
+
+  test("assistant messages are extraction inputs (dated, role-labelled)", async () => {
+    const { deps, llm } = testWorld({
+      script: [{ memories: [{ text: "The user and Engram agreed to ship on May 9, 2026.", linked_refs: [] }] }],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "So when do we ship?");
+    deps.store.appendEvent(thread.id, "tool_call", {
+      intent: "done_for_now",
+      message: "We agreed to ship on Friday, May 9, 2026.",
+    });
+
+    let captured = "";
+    const original = llm.structured.bind(llm);
+    llm.structured = async function <T>(req: StructuredRequest<T>): Promise<T> {
+      captured = req.user;
+      return original(req);
+    };
+    const { added } = await extractFromThread(deps, thread.id);
+    expect(added.length).toBe(1);
+    expect(captured).toContain("assistant: We agreed to ship on Friday, May 9, 2026.");
+    // Each new message carries its own grounding date (constitution VI).
+    expect(captured).toMatch(/\[\d{4}-\d{2}-\d{2}\] user: So when do we ship\?/);
+  });
+
+  test("extraction prompt grounds each new message on its own date", () => {
+    const prompt = buildExtractionUser({
+      recentContext: [],
+      existingMemories: [],
+      newMessages: [
+        { role: "user", text: "I flew to Osaka yesterday.", date: "2026-08-01" },
+        { role: "user", text: "The jet lag finally cleared today.", date: "2026-08-04" },
+      ],
+      observationDate: "2026-08-01",
+      currentDate: "2026-08-19",
+    });
+    expect(prompt).toContain("[2026-08-01] user: I flew to Osaka yesterday.");
+    expect(prompt).toContain("[2026-08-04] user: The jet lag finally cleared today.");
+    expect(prompt).toContain("## Observation Date (date of the first new message)");
   });
 
   test("no new messages -> early return without an LLM call", async () => {

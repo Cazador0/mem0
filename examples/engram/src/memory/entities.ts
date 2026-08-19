@@ -125,15 +125,18 @@ export class EntityIndex {
     const boosts: Record<string, number> = {};
     try {
       for (const entity of extractEntities(query).slice(0, 8)) {
-        const row = this.findByData(entity.data.toLowerCase(), scope);
-        if (!row) continue;
-        const linked = JSON.parse(row.linked_memory_ids) as string[];
-        const boost = ENTITY_BOOST_WEIGHT * crowdPenalty(linked.length);
-        for (const memoryId of linked) {
-          boosts[memoryId] = Math.min(
-            ENTITY_BOOST_WEIGHT,
-            Math.max(boosts[memoryId] ?? 0, boost),
-          );
+        // Read side filters on supplied scope keys only (mem0 subset
+        // semantics, mirroring ArchivalMemory.search) — the same entity may
+        // exist as separate rows under different writer identities.
+        for (const row of this.findAllByData(entity.data.toLowerCase(), scope)) {
+          const linked = JSON.parse(row.linked_memory_ids) as string[];
+          const boost = ENTITY_BOOST_WEIGHT * crowdPenalty(linked.length);
+          for (const memoryId of linked) {
+            boosts[memoryId] = Math.min(
+              ENTITY_BOOST_WEIGHT,
+              Math.max(boosts[memoryId] ?? 0, boost),
+            );
+          }
         }
       }
     } catch (err) {
@@ -142,12 +145,36 @@ export class EntityIndex {
     return boosts;
   }
 
+  /** Write-path lookup: exact match on the full (''-normalized) writer scope. */
   private findByData(dataLower: string, scope: Scope): EntityRow | null {
     return this.db
       .query(
         "SELECT id, data, entity_type, linked_memory_ids FROM entities WHERE data = ? AND user_id = ? AND agent_id = ? AND run_id = ?",
       )
       .get(dataLower, scope.userId ?? "", scope.agentId ?? "", scope.runId ?? "") as EntityRow | null;
+  }
+
+  /** Read-path lookup: restrict only on the scope keys the caller supplied. */
+  private findAllByData(dataLower: string, scope: Scope): EntityRow[] {
+    const clauses = ["data = ?"];
+    const params: string[] = [dataLower];
+    if (scope.userId !== undefined) {
+      clauses.push("user_id = ?");
+      params.push(scope.userId);
+    }
+    if (scope.agentId !== undefined) {
+      clauses.push("agent_id = ?");
+      params.push(scope.agentId);
+    }
+    if (scope.runId !== undefined) {
+      clauses.push("run_id = ?");
+      params.push(scope.runId);
+    }
+    return this.db
+      .query(
+        `SELECT id, data, entity_type, linked_memory_ids FROM entities WHERE ${clauses.join(" AND ")}`,
+      )
+      .all(...params) as EntityRow[];
   }
 
   private rowsInScope(scope: Scope): EntityRow[] {

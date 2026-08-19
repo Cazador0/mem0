@@ -133,11 +133,18 @@ export function stepsThisTurn(thread: Thread): number {
   return steps;
 }
 
-/** Trailing consecutive error events (factor 9: escalate at ~3). */
+/**
+ * Trailing consecutive error events (factor 9: escalate at ~3). A background
+ * extraction's memory_write landing between two errors is skipped — it must
+ * not reset the escalation count (same reasoning as effectiveTail). A
+ * system_note DOES break the run: a scheduler wake starts a new turn.
+ */
 export function consecutiveErrors(thread: Thread): number {
   let n = 0;
   for (let i = thread.events.length - 1; i >= 0; i--) {
-    if (thread.events[i]!.type === "error") n++;
+    const type = thread.events[i]!.type;
+    if (type === "memory_write") continue;
+    if (type === "error") n++;
     else break;
   }
   return n;

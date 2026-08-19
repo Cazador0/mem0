@@ -27,7 +27,7 @@ You are a Memory Extractor — a precise, evidence-bound processor that extracts
 # RULES
 - Contextually rich, not atomic. Bad: "User has a dog". Good: "User has a dog named Poppy and their morning walks together are the highlight of their day".
 - Concise but complete: 15-80 words per memory.
-- Temporal grounding: resolve ALL relative time references ("yesterday", "last week") against the Observation Date — never the Current Date. "User went to Paris last week" is useless 6 months later; "User went to Paris the week of May 15, 2023" is meaningful forever.
+- Temporal grounding: every New Message line is prefixed with the date it was said ([YYYY-MM-DD]). Resolve ALL relative time references ("yesterday", "last week") against THAT message's own date — never the Current Date. "User went to Paris last week" is useless 6 months later; "User went to Paris the week of May 15, 2023" is meaningful forever.
 - Existing Memories are provided ONLY for deduplication and linking — do NOT extract new memories from them, and do NOT import their details into new memories. When a new memory relates to an Existing Memory (same topic, overlapping entities, updated preference, follow-up event), put that memory's integer ref in "linked_refs".
 - No fabrication: every detail must trace to the inputs. No implicit inference of gender, age, ethnicity, etc.
 - No echo extraction: when an assistant message merely restates what the user already said, do not extract it again.
@@ -39,12 +39,16 @@ You are a Memory Extractor — a precise, evidence-bound processor that extracts
 export function buildExtractionUser(opts: {
   recentContext: Array<{ role: string; text: string }>;
   existingMemories: Array<{ ref: number; text: string }>;
-  newMessages: Array<{ role: string; text: string }>;
+  newMessages: Array<{ role: string; text: string; date: string }>;
   observationDate: string;
   currentDate: string;
 }): string {
   const lines = (msgs: Array<{ role: string; text: string }>) =>
     msgs.map(m => `${m.role}: ${m.text}`).join("\n") || "(none)";
+  // Per-message dates: one batch can span days (a thread that slept, a backlog
+  // extraction) and a single batch-level date would mis-ground later messages.
+  const datedLines = (msgs: Array<{ role: string; text: string; date: string }>) =>
+    msgs.map(m => `[${m.date}] ${m.role}: ${m.text}`).join("\n") || "(none)";
   const existing =
     opts.existingMemories.map(m => JSON.stringify({ ref: m.ref, text: m.text })).join("\n") || "(none)";
   return [
@@ -54,10 +58,10 @@ export function buildExtractionUser(opts: {
     `## Existing Memories`,
     existing,
     ``,
-    `## New Messages (extract from these)`,
-    lines(opts.newMessages),
+    `## New Messages (extract from these; each line's [date] grounds its relative times)`,
+    datedLines(opts.newMessages),
     ``,
-    `## Observation Date`,
+    `## Observation Date (date of the first new message)`,
     opts.observationDate,
     ``,
     `## Current Date`,

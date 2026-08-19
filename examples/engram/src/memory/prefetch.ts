@@ -16,9 +16,11 @@ export interface PrefetchResult {
 export async function prefetchArchival(deps: EngramDeps, thread: Thread): Promise<PrefetchResult | null> {
   const seed = latestHumanText(thread);
   if (!seed) return null;
+  // User-scoped read (mem0's sharing model), matching archival_search in
+  // execute.ts — a curator thread pre-fetches the user's memories too.
   const results = await deps.archival.search({
     query: seed,
-    scope: { userId: thread.userId, agentId: thread.agentId, runId: thread.runId },
+    scope: { userId: thread.userId },
     topK: 5,
   });
   if (results.length === 0) return null;
