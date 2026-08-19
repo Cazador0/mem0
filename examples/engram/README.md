@@ -30,10 +30,18 @@ Try in chat: *"My dog is named Poppy and we walk every morning"* → the agent u
 curl -X POST :7749/threads -d '{"message":"remember that I prefer window seats","user_id":"hunter"}'
 curl :7749/threads/<id>                        # observability = dump the log
 curl -X POST :7749/threads/<id>/response \
-     -d '{"type":"response","response":"yes please"}'      # resume a paused thread
+     -d '{"type":"response","response":"yes please"}'      # resume a paused (or sleeping) thread
 curl -X POST :7749/threads/<id>/response \
      -d '{"type":"approval","approved":true}'              # approve a gated memory_delete
 ```
+
+`user_id` is required — memories are scoped per user, and a shared anonymous
+scope would silently merge every caller's memory. A `response` also wakes a
+sleeping thread early; its pending scheduled wake is then consumed as stale.
+
+> **Threat model**: the HTTP server has no authentication — it is a local-first
+> example. On an exposed port, anyone can resume threads and approve gated
+> deletes, so the approval gate is a workflow control, not a security boundary.
 
 ## Configuration
 
@@ -45,14 +53,17 @@ curl -X POST :7749/threads/<id>/response \
 | `ENGRAM_DB` | `engram.sqlite` | SQLite path (`:memory:` for ephemeral) |
 | `ENGRAM_EMBEDDINGS_URL` | — | OpenAI-compatible embeddings base URL; unset = degraded FTS+entity search |
 | `ENGRAM_EMBEDDINGS_MODEL` / `_DIMS` | `text-embedding-3-small` / `1536` | embedding config |
+| `ENGRAM_EMBEDDINGS_API_KEY` | — | bearer token for the embeddings endpoint (omit for keyless local servers) |
 | `ENGRAM_MAX_STEPS` | `20` | LLM steps per loop entry (12-factor factor 10) |
 | `PORT` | `7749` | HTTP port |
 
 ## What's here vs. what's next
 
-Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, the extraction pipeline with provenance + linking, hybrid scoring, entity index, durable sleep + scheduler, subagent spawn, HTTP pause/resume, CLI channel.
+Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark) with provenance + linking, hybrid scoring, entity index, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI shares the tested thread machinery and its approval-reply parsing is unit-tested; the interactive REPL itself is exercised manually, not in CI.
 
-Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), wiring constitution-gate evaluation into a planning phase, SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out, prompt-eval suite against the live model.
+Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), wiring constitution-gate evaluation into a planning phase, compaction/distillation of the elided event region at the render seam, a scheduler wake lease + startup reset (delivery is currently at-most-once), trimming the hot path to bun:sqlite's 20-statement `db.query()` cache, PreToolUse hooks that mechanically enforce the CLAUDE.md CRITICAL rules, SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out, prompt-eval suite against the live model.
+
+Known constraints (deliberate for a local-first example): the per-thread lock is in-process, so exactly one Engram process may own a database file; entity matching is exact normalized-text (no embedding round-trip) — plural/paraphrase mentions miss where mem0's semantic matching would hit, measurable via `explain: true`.
 
 ## Architecture
 

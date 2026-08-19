@@ -32,6 +32,7 @@ test("my scenario", async () => {
   const thread = deps.store.createThread("engram", { userId: "u1", agentId: "engram" });
   deps.store.appendEvent(thread.id, "user_input", "hello");
   const finished = await agentLoop(thread.id, deps);
+  expect(finished.events.filter(e => e.type === "error")).toEqual([]); // loop swallows LLM errors — assert none
   expect(finished.events.map(e => e.type)).toEqual(["user_input", "tool_call"]); // content before status
 });
 ```
@@ -48,7 +49,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/memory/archival.ts` | Archival tier facade: insert/search/update/delete + history audit |
 | `src/memory/scoring.ts` | Hybrid scoring (mem0 port): cosine, sigmoid-BM25, entity boost, adaptive divisor |
 | `src/memory/entities.ts` | Best-effort entity→memories inverted index (regex extractor, no NLP dep) |
-| `src/memory/extraction.ts` | mem0-V3 phased ADD-only pipeline; only its LLM phase throws |
+| `src/memory/extraction.ts` | mem0-V3 phased ADD-only pipeline; only its LLM phase throws; serialized per thread (`extract:` lock) with a monotonic watermark |
 | `src/memory/prefetch.ts` | Deterministic memory injection at loop entry (12-factor appendix 13) |
 | `src/agent/thread.ts` | Thread/Event types, derived-status predicates, ref-map reconstruction |
 | `src/agent/intents.ts` | The Zod intent union + routing table + per-agent subsetting |
@@ -57,7 +58,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/agent/render.ts` | THE context seam: only place deciding what the model sees |
 | `src/agent/llm.ts` | Anthropic wrapper: schema-validated output, refusal handling, retries |
 | `src/agents/registry.ts` | Specialist agents as data (persona + intent subset) |
-| `src/orchestration/` | Constitution loading + gate-evaluation module (pipeline wiring: roadmap); durable-sleep scheduler |
+| `src/orchestration/` | Constitution loading + gate-evaluation module (pipeline wiring: roadmap); durable-sleep scheduler; per-thread promise mutex (`lock.ts`) every loop entry and extraction must hold |
 | `src/server/routes.ts` | Launch/pause/resume over HTTP; resume validated against derived status |
 
 ## Do NOT
@@ -65,6 +66,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 - Mutate or delete an event row — the log is append-only (constitution I).
 - Put real memory UUIDs in a prompt — integer-ref indirection only (constitution IV).
 - Let scope (`user_id`/`agent_id`/`run_id`) enter payloads anywhere except `RecallStore`/`ArchivalMemory` internals; caller metadata is stripped of identity keys.
+- Reintroduce exact three-column scope equality on an archival READ path — reads filter only on supplied keys (user-scoped sharing across agents); writes keep the full thread identity. Exact-match reads are the bug that made the curator agent blind to every user memory.
 - Make the entity index load-bearing — it is best-effort by design; its failures warn and continue.
 - Execute a gated intent inline — record it, break, and let the resume path replay it after approval.
 - Use `require()` — ES module imports only (repo-wide rule).

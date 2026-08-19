@@ -23,14 +23,16 @@ merging dynamic graph-state workflows with persistent, tiered core/archival memo
 |---|---|
 | 12-factor-agents | Stateless reducer `agentLoop(thread) → thread'`; append-only Event log unifying execution+business state; one LLM call → one intent from a Zod discriminated union; two-switch split (route vs execute); derived-status predicates over the log tail; compact errors with counter-gated escalation (3 consecutive → human); pre-fetch memory deterministically instead of offering a fetch tool; pause/resume by thread id from any channel |
 | MemGPT concept, stored the mem0 way | Core tier: named, char-budgeted, self-editable blocks rendered into every system prompt with visible budget pressure; memory edits are sync intents so the loop chains them without a human turn (heartbeat) |
-| mem0 (V3 pipeline) | ADD-only extraction (one LLM call, Observation-Date temporal grounding, integer-ID indirection, rich-not-atomic 15–80-word memories, no-fabrication/no-echo rules), xxHash64 code-side dedup, insert with per-item fallback, append-only history audit table, entity side-index with crowd-penalty boost, hybrid scoring with semantic-threshold gating *before* boosting, scope keys entering payloads in exactly one function, identity-key stripping at write entries, expiration filtered at read time, procedural memory via verbatim-preserving run summarization; ADD/UPDATE/DELETE/NONE reconciliation survives **only** as an offline, audited, approval-gated compaction job *(roadmap)* |
-| spec-kit | `constitution.md` (semver + ratified/amended dates) rendered as a read-only core block; structured gate results `{principle, pass, justification?}` — unjustified failure is an ERROR *(evaluation module built; wiring into a planning phase is roadmap)*; `needs_clarification` intent with max-3 impact-ranked markers and recommended-option quick replies; deterministic code gathers facts before any LLM judgment; CLAUDE.md managed region between markers that points at live state |
+| mem0 (V3 pipeline) | ADD-only extraction (one LLM call, per-message temporal grounding against each message's own date, integer-ID indirection, rich-not-atomic 15–80-word memories, no-fabrication/no-echo rules), xxHash64 code-side dedup, insert with per-item fallback, append-only history audit table, entity side-index with crowd-penalty boost, hybrid scoring with semantic-threshold gating *before* boosting, scope keys entering payloads in exactly one function, identity-key stripping at write entries, expiration filtered at read time, procedural memory via verbatim-preserving run summarization; ADD/UPDATE/DELETE/NONE reconciliation survives **only** as an offline, audited, approval-gated compaction job *(roadmap)*. **Deliberate simplification vs mem0**: entity matching is exact normalized-text with similarity fixed at 1 (no TOPIC type, no embedding round-trip) — mem0 upserts entities at ≥0.95 similarity and matches reads at a 0.5 floor, so plural/paraphrase mentions that mem0 would catch are missed here; the recall cost is measurable via `explain: true`, and semantic entity matching is an optional upgrade when an embedder is configured |
+| spec-kit | `constitution.md` (semver + ratified/amended dates) rendered as a read-only core block — "rendered" per §8(d–e): the block holds version + digest + a pointer, never an inlined copy; structured gate results `{principle, pass, justification?}` — unjustified failure is an ERROR *(evaluation module built; wiring into a planning phase is roadmap)*; `needs_clarification` intent with max-3 impact-ranked markers and recommended-option quick replies; deterministic code gathers facts before any LLM judgment; CLAUDE.md managed region between markers that points at live state |
 | BMAD-METHOD | Specialist agents as **data** `{id, persona, intentUnion subset}`; subagents run on fresh threads, write full output there, and return `{verdict, topFindings, ref}`; CAS state transitions (`UPDATE … WHERE <expected previous state>`); capsule compiler and asymmetric-context review fan-out *(roadmap)* |
-| bun | `bun:sqlite` WAL + strict + prepared statements + immediate transactions; FTS5 for both Recall and Archival keyword legs; UUIDv7 PKs (sortable = free recency); xxHash64 content fingerprints; layered CLAUDE.md with enforced invariants; hermetic test harness |
+| bun | `bun:sqlite` WAL + strict + prepared statements + immediate transactions; FTS5 for both Recall and Archival keyword legs; UUIDv7 PKs (sortable = free recency); xxHash64 content fingerprints; layered CLAUDE.md with enforced invariants; hermetic test harness. Platform caveats: FTS5 is guaranteed only where Bun statically links SQLite (Linux/Windows) — on macOS it dlopens the system libsqlite3, so `openDb` probes FTS5 at startup (constitution VII) and `closeDb` checkpoints the WAL on shutdown; `Database.setCustomSQLite(path)` is the macOS remedy. `db.query()` caches at most 20 persistent prepared statements per Database — the codebase currently routes ~38 distinct SQL strings through it, so hot statements churn through re-prepare *(trimming to a fixed hot set is roadmap)* |
 
 ## 3. Storage schema (single SQLite file)
 
-See `src/db/migrations/001_init.sql`:
+See `src/db/migrations/` (`001_init.sql`, plus `002_schedule_sleep_seq.sql` —
+schedules rows carry the creating `sleep_until` event's seq so a superseded
+sleep's wake is consumed as stale instead of waking the newer sleep early):
 
 - `threads` — id (uuidv7), agent_id, scope_key, user/run ids, `status_hint` (display cache only — status is always derived), `extracted_seq` extraction watermark.
 - `events` — the Recall tier and reducer state; `UNIQUE(thread_id, seq)`; closed type enum `user_input | system_note | tool_call | tool_response | human_response | error | memory_write`; `events_fts` (FTS5) over a text projection.
@@ -38,8 +40,18 @@ See `src/db/migrations/001_init.sql`:
 - `memories` — Archival tier: content, xxHash64 `hash` (UNIQUE per scope), embedding BLOB (nullable), scope columns, `memory_type` (fact|decision|procedural), provenance (`source_thread_id`, `source_event_seqs`), `expiration_date`, metadata JSON; `memories_fts` for the BM25 leg.
 - `entities` — entity → `linked_memory_ids` inverted index (regex-extracted, best-effort).
 - `memory_history` — append-only audit of every ADD/UPDATE/DELETE with before/after values; deletes soft in history.
-- `schedules` — durable sleep rows claimed by CAS on wake.
+- `schedules` — durable sleep rows claimed by CAS on wake; `sleep_seq` links each
+  row to its creating event (002). Delivery is **at-most-once**: a crash between
+  the CAS claim and the wake note loses that wake — a lease + startup reset is
+  roadmap.
 - `artifacts` — registry for capsule/artifact handoffs *(roadmap: capsule compiler)*.
+
+**Scope semantics** (mem0 parity): writes store the full thread identity
+(`user_id`, `agent_id`, `run_id`, absent keys normalized to `""`), and write-side
+dedup is exact on all three columns. **Reads filter only on the keys the caller
+supplies** — `archival_search`, prefetch, and extraction Phase 1 pass
+`{userId}` alone, so memories belong to the *user* and a curator thread sees
+what engram threads wrote. A supplied `""` matches exactly; it never wildcards.
 
 ## 4. Tool-calling schemas (the intent union)
 
@@ -73,14 +85,22 @@ engram/
 ├── docs/HANDOFF-SPEC.md
 ├── src/
 │   ├── index.ts / cli.ts / bootstrap.ts / config.ts / deps.ts
-│   ├── db/database.ts + db/migrations/001_init.sql
+│   ├── db/database.ts + db/migrations/{001_init,002_schedule_sleep_seq}.sql
 │   ├── memory/{core,recall,archival,scoring,entities,embeddings,extraction,prefetch,procedural}.ts
-│   ├── agent/{thread,intents,loop,execute,render,llm}.ts
+│   ├── prompts/{extraction,nextstep}.ts        # every LLM-facing template in one place
+│   ├── agent/{thread,intents,loop,execute,render,llm,approval}.ts
 │   ├── agents/registry.ts
-│   ├── orchestration/{gates,scheduler}.ts
+│   ├── orchestration/{gates,scheduler,lock}.ts # lock = per-thread promise mutex
 │   └── server/routes.ts
 └── test/{harness,preload}.ts + *.test.ts
 ```
+
+`orchestration/lock.ts` is load-bearing: **every** loop entry (HTTP create and
+resume, scheduler wakes, the CLI) runs under `withThreadLock(threadId, …)`, and
+background extraction serializes under its own `extract:<threadId>` key. The
+lock is in-process — exactly one Engram process may own a database file; a
+second process would interleave loop entries (the seq UNIQUE constraint makes
+losers fail loudly, but the log would still record a garbled conversation).
 
 ## 6. Implementation rules (non-negotiable; see constitution.md)
 
@@ -101,6 +121,17 @@ engram/
    approval replay of the recorded event.
 7. Tests are hermetic (in-memory DB, scripted LLM, no timers-as-waits) and must be
    green before any commit.
+8. **Step budget & turn boundaries**: `maxSteps` (config default 20, per-agent
+   override) bounds LLM steps per TURN, not per thread lifetime. Turn boundaries
+   are `user_input`, `human_response`, `system_note` (scheduler wake), and
+   `tool_response` events flagged `via_human: true`. Every channel that resumes a
+   thread with a human approval/denial MUST set `via_human` on the appended
+   `tool_response` — a channel that forgets it makes long approval chains exhaust
+   the budget and brick the thread. (The CLI and HTTP resume paths both comply.)
+9. **Read vs write scope**: archival writes carry the full thread identity;
+   archival reads are user-scoped subset filters (see §3 "Scope semantics").
+   New read paths must not silently reintroduce exact three-column equality —
+   that is the bug that made the curator agent blind to every user memory.
 
 ## 7. Roadmap (specified, not yet built)
 
@@ -123,6 +154,29 @@ engram/
   the live model asserting chosen intents — recorded-response mode for CI.
 - **CLAUDE.md generator** (`context/claudemd.ts`): marker-region upsert handling
   all four corruption states, manifest-hash ownership, pointer-not-copy content.
+- **Render-seam compaction**: today everything beyond the 50-event verbatim tail
+  is elided behind a marker pointing at `recall_search`, which recovers keyword
+  hits but not mid-thread commitments. 12-factor's stored-vs-rendered doctrine
+  sanctions summarizing the elided region; BMAD's distillator supplies the
+  contract (compression-not-summarization; never drop decisions, rejected
+  alternatives, open questions, constraints; completeness checks). The obvious
+  next feature for long-lived threads.
+- **Scheduler wake lease**: replace at-most-once delivery with a claim lease +
+  startup reset so a crash between the CAS claim and the wake note cannot
+  silently lose a wake.
+- **Extraction retry queue**: extraction advances the watermark past per-item
+  insert failures (warn-and-continue), so a failed item is never retried; hash
+  dedup makes retry cheap — hold the watermark on partial failure or queue
+  failed items.
+- **Statement-cache trim**: precompile the hot path (appendEvent, search) as a
+  fixed set of ≤20 `db.query()` statements; move the long tail to `prepare()`.
+- **Mechanical rule enforcement**: PreToolUse hooks that deny `bun test` against
+  a real `.sqlite` path and raw INSERTs into `events`/`memories` in test code —
+  bun's proven pattern, deriving the repo root rather than hardcoding it.
+
+**Threat model note**: the HTTP server is unauthenticated by design (local-first
+example). On an exposed port, anyone can resume threads and approve gated
+deletes — the approval gate is a workflow control, not a security boundary.
 
 ## 8. CLAUDE.md generation guidelines
 
