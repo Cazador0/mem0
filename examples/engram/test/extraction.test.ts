@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { testWorld, type ScriptedLLM } from "./harness";
-import { extractFromThread } from "../src/memory/extraction";
+import { extractFromThread, MAX_EXTRACTION_ATTEMPTS } from "../src/memory/extraction";
 import { buildExtractionUser } from "../src/prompts/extraction";
 import { LLMError, type StructuredRequest } from "../src/agent/llm";
 
@@ -146,6 +146,57 @@ describe("archival extraction pipeline (mem0 V3, ADD-only)", () => {
     expect(prompt).toContain("[2026-08-01] user: I flew to Osaka yesterday.");
     expect(prompt).toContain("[2026-08-04] user: The jet lag finally cleared today.");
     expect(prompt).toContain("## Observation Date (date of the first new message)");
+  });
+
+  test("a failed insert holds the watermark for a bounded retry, then gives up", async () => {
+    const facts = {
+      memories: [
+        { text: "User's dog is named Rex.", linked_refs: [] },
+        { text: "POISON: this memory always fails to store.", linked_refs: [] },
+      ],
+    };
+    const { deps } = testWorld({ script: [facts, facts, facts] });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "My dog is Rex and here is a poison fact.");
+
+    // One item fails to store; the other succeeds.
+    const realInsert = deps.archival.insert.bind(deps.archival);
+    deps.archival.insert = async args => {
+      if (args.content.startsWith("POISON")) throw new Error("disk full");
+      return realInsert(args);
+    };
+
+    // Attempt 1: partial failure -> watermark HELD so the lost memory retries.
+    const first = await extractFromThread(deps, thread.id);
+    expect(first.added.length).toBe(1);
+    expect(first.failures).toBe(1);
+    expect(deps.store.getThread(thread.id).extractedSeq).toBe(-1); // not advanced
+    expect(deps.store.extractFailures(thread.id)).toBe(1);
+
+    // Attempt 2 re-extracts the same window; the good memory dedups by hash.
+    const second = await extractFromThread(deps, thread.id);
+    expect(second.added.length).toBe(0);
+    expect(second.failures).toBe(1);
+
+    // Bounded: after MAX attempts the watermark advances so the thread cannot
+    // re-extract this window forever over one permanently-broken item.
+    expect(deps.store.getThread(thread.id).extractedSeq).toBeGreaterThanOrEqual(0);
+    expect(deps.store.extractFailures(thread.id)).toBe(0);
+    expect(MAX_EXTRACTION_ATTEMPTS).toBe(2);
+  });
+
+  test("a clean run clears a previous partial-failure counter", async () => {
+    const { deps } = testWorld({
+      script: [{ memories: [{ text: "User prefers aisle seats on flights.", linked_refs: [] }] }],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "I prefer aisle seats.");
+    deps.store.setExtractFailures(thread.id, 1); // debris from an earlier bad run
+
+    const result = await extractFromThread(deps, thread.id);
+    expect(result.failures).toBe(0);
+    expect(deps.store.extractFailures(thread.id)).toBe(0);
+    expect(deps.store.getThread(thread.id).extractedSeq).toBe(0);
   });
 
   test("no new messages -> early return without an LLM call", async () => {

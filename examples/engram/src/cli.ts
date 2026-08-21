@@ -1,29 +1,32 @@
 import { loadConfig } from "./config";
 import { bootstrap } from "./bootstrap";
 import { agentLoop } from "./agent/loop";
-import { executeStep } from "./agent/execute";
 import { extractFromThread } from "./memory/extraction";
 import { startScheduler } from "./orchestration/scheduler";
-import { withThreadLock } from "./orchestration/lock";
-import { outwardText } from "./agent/render";
-import { classifyApprovalReply } from "./agent/approval";
-import {
-  awaitingApproval,
-  awaitingHumanResponse,
-  deriveStatus,
-  effectiveTail,
-  eventAsStep,
-} from "./agent/thread";
+import { runCliTurn } from "./channels/cli-turn";
 
 /**
  * Local chat REPL — the CLI channel adapter. The same thread machinery the
- * HTTP server uses; the channel only decides how pauses are presented.
+ * HTTP server uses; the channel only decides how pauses are presented. All
+ * decision logic lives in channels/cli-turn.ts so it is testable without a
+ * terminal; this file is I/O only.
  */
 const config = loadConfig();
 const deps = bootstrap(config);
 startScheduler(deps, id => agentLoop(id, deps));
 
-const userId = process.env.USER ?? "local";
+// Scope is the whole point of the memory tiers, so never pick it silently:
+// with neither variable set (containers, CI, some systemd units) every session
+// would share one "local" scope — the same anonymous-merging problem the HTTP
+// channel rejects outright by requiring user_id.
+const configuredUser = process.env.ENGRAM_USER ?? process.env.USER ?? "";
+if (!configuredUser) {
+  console.warn(
+    "[engram] neither ENGRAM_USER nor USER is set — this session reads and writes the " +
+      'shared "local" memory scope. Set ENGRAM_USER to keep your memories separate.',
+  );
+}
+const userId = configuredUser || "local";
 const thread = deps.store.createThread("engram", { userId, agentId: "engram" });
 
 console.log(`engram chat — thread ${thread.id} (model ${config.model}). Type a message; Ctrl+C to exit.\n`);
@@ -36,56 +39,26 @@ for await (const line of console) {
     continue;
   }
 
-  // The whole read-append-run sequence holds the thread lock so a scheduler
-  // wake firing mid-typing can never interleave a second loop into this log.
-  const handled = await withThreadLock(thread.id, async () => {
-    const current = deps.store.getThread(thread.id);
-    if (awaitingApproval(current)) {
-      const recorded = eventAsStep(effectiveTail(current));
-      if (!recorded) return true;
-      const reply = classifyApprovalReply(input);
-      if (reply === "approve") {
-        const result = await executeStep(recorded, current, deps, { runLoop: id => agentLoop(id, deps) });
-        deps.store.appendEvent(thread.id, "tool_response", { ...result, via_human: true });
-      } else if (reply === "deny") {
-        deps.store.appendEvent(thread.id, "tool_response", {
-          intent: recorded.intent,
-          ok: false,
-          result: `user denied the operation with feedback: "${input}"`,
-          via_human: true,
-        });
-      } else {
-        // Neither clearly yes nor no while a gated step is pending: re-prompt
-        // instead of silently treating "Yes please" typos as a denial.
-        console.log("\n(a gated action is awaiting approval — please answer yes or no)\n");
-        return false;
-      }
-    } else if (awaitingHumanResponse(current)) {
-      deps.store.appendEvent(thread.id, "human_response", { response: input });
-    } else {
-      deps.store.appendEvent(thread.id, "user_input", input);
-    }
+  const turn = await runCliTurn(deps, thread.id, input);
 
-    try {
-      const finished = await agentLoop(thread.id, deps);
-      const message = outwardText(finished);
-      if (message) console.log(`\nengram: ${message}\n`);
-      else console.log(`\n(status: ${deriveStatus(finished)})\n`);
-    } catch (err) {
-      console.error(`\n[engram] loop failed: ${(err as Error).message}\n`);
-    }
-    return true;
-  });
-  if (!handled) {
-    process.stdout.write("> ");
-    continue;
+  if (turn.action === "reprompt") {
+    // Neither clearly yes nor no while a gated step is pending: re-prompt
+    // instead of silently treating "Yes please" typos as a denial.
+    console.log("\n(a gated action is awaiting approval — please answer yes or no)\n");
+  } else if (turn.error) {
+    console.error(`\n[engram] loop failed: ${turn.error}\n`);
+  } else if (turn.action !== "noop") {
+    if (turn.outward) console.log(`\nengram: ${turn.outward}\n`);
+    else console.log(`\n(status: ${turn.status})\n`);
   }
 
-  void extractFromThread(deps, thread.id)
-    .then(result => {
-      if (result.added.length > 0) console.log(`[memory] archived ${result.added.length} new memories`);
-    })
-    .catch(() => {});
+  if (turn.handled) {
+    void extractFromThread(deps, thread.id)
+      .then(result => {
+        if (result.added.length > 0) console.log(`[memory] archived ${result.added.length} new memories`);
+      })
+      .catch(() => {});
+  }
 
   process.stdout.write("> ");
 }

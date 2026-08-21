@@ -10,6 +10,8 @@ export function buildSystemPrompt(opts: {
   agentPersona: string;
   constitutionVersion: string;
   constitutionDigest: string;
+  /** Principle titles only — the gate vocabulary, never the constitution body. */
+  principles?: readonly string[];
   intents: readonly IntentName[];
   coreBlocks: string;
 }): string {
@@ -18,6 +20,11 @@ export function buildSystemPrompt(opts: {
     `You are an Engram agent: a persistent assistant with tiered memory (core blocks always in this prompt; recall = this conversation's event log; archival = long-term searchable memory).`,
     ``,
     `Project constitution v${opts.constitutionVersion} (digest ${opts.constitutionDigest}) is non-negotiable; when work conflicts with it, adjust the work, never the principle.`,
+    // Titles only: the constitution stays a pointer, not an inlined copy
+    // (spec §8e), but gate_results must name a real principle verbatim.
+    ...(opts.principles?.length
+      ? [`Its principles, by name: ${opts.principles.join("; ")}.`]
+      : []),
     ``,
     `# Persona`,
     opts.agentPersona,

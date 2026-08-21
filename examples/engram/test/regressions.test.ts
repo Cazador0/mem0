@@ -5,11 +5,17 @@ import { executeStep } from "../src/agent/execute";
 import { extractJson } from "../src/agent/llm";
 import { renderEvent, renderUserMessage } from "../src/agent/render";
 import { classifyApprovalReply } from "../src/agent/approval";
-import { envelopeForIntents } from "../src/agent/intents";
+import { ALL_INTENTS, envelopeForIntents } from "../src/agent/intents";
 import { ArchivalMemory } from "../src/memory/archival";
 import { prefetchArchival } from "../src/memory/prefetch";
+import { extractFromThread } from "../src/memory/extraction";
 import { withThreadLock } from "../src/orchestration/lock";
-import { tickScheduler, scheduleWake } from "../src/orchestration/scheduler";
+import {
+  recoverPendingWakes,
+  scheduleWake,
+  tickScheduler,
+  WAKE_LEASE_MS,
+} from "../src/orchestration/scheduler";
 import {
   awaitingApproval,
   awaitingHumanResponse,
@@ -452,15 +458,46 @@ describe("review regressions", () => {
     await expect(withThreadLock("t1", async () => "after")).resolves.toBe("after");
   });
 
-  test("per-agent intent subsetting: intents outside the union fail validation", () => {
+  test("per-agent intent subsetting: the union is exactly the agent's intent set", () => {
     const { deps } = testWorld();
-    const envelope = envelopeForIntents(deps.registry.get("curator")!.intents);
-    const spawn = envelope.safeParse({
-      next_step: { intent: "spawn_subagent", agent_id: "engram", task: "recurse" },
-    });
-    expect(spawn.success).toBe(false);
-    const search = envelope.safeParse({ next_step: { intent: "archival_search", query: "q" } });
-    expect(search.success).toBe(true);
+    const curator = deps.registry.get("curator")!.intents;
+    const envelope = envelopeForIntents(curator);
+
+    // Minimal well-formed payload per intent, so a parse failure means the
+    // intent is ABSENT from the union rather than merely malformed.
+    const sample: Record<string, Record<string, unknown>> = {
+      core_append: { block: "human", content: "x" },
+      core_replace: { block: "human", old_text: "a", new_text: "b" },
+      archival_insert: { content: "x" },
+      archival_search: { query: "q" },
+      recall_search: { query: "q" },
+      memory_update: { ref: 1, new_content: "x", reason: "r" },
+      memory_delete: { ref: 1, reason: "r" },
+      request_human_input: { question: "q" },
+      needs_clarification: {
+        markers: [{ question: "q", options: ["a", "b"], recommended: "a", impact: "scope" }],
+      },
+      sleep_until: { delay_minutes: 5, reason: "r" },
+      spawn_subagent: { agent_id: "curator", task: "t" },
+      done_for_now: { message: "m" },
+      complete_task: { outcome: "success", summary: "s" },
+      propose_plan: {
+        summary: "s",
+        steps: ["a"],
+        gate_results: [{ principle: "Local-first, one artifact", pass: true }],
+      },
+    };
+
+    // Adding an intent to the union without adding it here would silently
+    // shrink this test's coverage, so make that a failure instead.
+    expect(Object.keys(sample).sort()).toEqual([...ALL_INTENTS].sort());
+
+    // Every intent the agent HAS parses, and every intent it lacks does not —
+    // dropping or adding any single intent to CURATOR_INTENTS fails this.
+    for (const [intent, fields] of Object.entries(sample)) {
+      const parsed = envelope.safeParse({ next_step: { intent, ...fields } });
+      expect({ intent, ok: parsed.success }).toEqual({ intent, ok: curator.includes(intent as never) });
+    }
   });
 
   test("approval replies classify approve/deny/unclear — unclear re-prompts, never denies", () => {
@@ -566,6 +603,56 @@ describe("review regressions", () => {
     }
   });
 
+  test("resume payloads are rejected when they do not match the derived status", async () => {
+    // The happy-path tests never make these guards the deciding branch: without
+    // this test both `badRequest` returns can be deleted and CI stays green,
+    // letting an approval POST re-execute a tool call on a thread that never
+    // asked for one.
+    const { deps } = testWorld({
+      script: [
+        step({ intent: "request_human_input", question: "Which city?" }),
+        step({ intent: "complete_task", outcome: "success", summary: "done" }),
+      ],
+    });
+    deps.config.port = 0;
+    const { createServer } = await import("../src/server/routes");
+    const server = createServer(deps);
+    const base = `http://localhost:${server.port}`;
+    try {
+      const awaiting = deps.store.createThread("engram", SCOPE);
+      deps.store.appendEvent(awaiting.id, "user_input", "book my trip");
+      await agentLoop(awaiting.id, deps);
+      expect(deriveStatus(deps.store.getThread(awaiting.id))).toBe("awaiting_human");
+
+      // An approval for a thread that is awaiting a RESPONSE, not an approval.
+      const wrongKind = await fetch(`${base}/threads/${awaiting.id}/response`, {
+        method: "POST",
+        body: JSON.stringify({ type: "approval", approved: true }),
+      });
+      expect(wrongKind.status).toBe(400);
+      expect(((await wrongKind.json()) as { error: string }).error).toMatch(/not awaiting approval/);
+
+      // A response for a thread that is finished (2 events: below summarizeRun's minimum).
+      const done = deps.store.createThread("engram", SCOPE);
+      deps.store.appendEvent(done.id, "user_input", "wrap up");
+      await agentLoop(done.id, deps);
+      expect(deriveStatus(deps.store.getThread(done.id))).toBe("completed");
+
+      const wrongStatus = await fetch(`${base}/threads/${done.id}/response`, {
+        method: "POST",
+        body: JSON.stringify({ type: "response", response: "one more thing" }),
+      });
+      expect(wrongStatus.status).toBe(400);
+      expect(((await wrongStatus.json()) as { error: string }).error).toMatch(/not awaiting a response/);
+
+      // The rejected payloads left no trace on either log.
+      expect(deps.store.getThread(awaiting.id).events.some(e => e.type === "tool_response")).toBe(false);
+      expect(deps.store.getThread(done.id).events.some(e => e.type === "human_response")).toBe(false);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("thread creation without user_id is rejected — anonymous callers never merge scopes", async () => {
     const { deps } = testWorld();
     deps.config.port = 0;
@@ -579,6 +666,180 @@ describe("review regressions", () => {
       expect(missing.status).toBe(400);
     } finally {
       await server.stop(true);
+    }
+  });
+
+  test("an in-flight extraction and a concurrent loop entry do not corrupt the log", async () => {
+    // The extraction lock is a SEPARATE namespace from the loop lock, so these
+    // two genuinely run at once on one thread. What keeps that safe is the
+    // Phase-0 snapshot plus memory_write being an ANNOTATION type; this test is
+    // the scenario itself, not the lock primitive in isolation.
+    const { deps, llm } = testWorld({
+      script: [step({ intent: "done_for_now", message: "noted" })],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "My dog is named Rex.");
+    await agentLoop(thread.id, deps);
+    expect(deriveStatus(deps.store.getThread(thread.id))).toBe("awaiting_human");
+
+    // Hold the extraction at its LLM call, then drive a loop entry through the
+    // (separate) thread lock while it is still in flight.
+    let release!: () => void;
+    const gate = new Promise<void>(r => (release = r));
+    let reached!: () => void;
+    const atLlm = new Promise<void>(r => (reached = r));
+    // Extraction answers off-script: the ordered script stays purely for
+    // next_step calls, so gating one does not shuffle the other's fixtures.
+    const original = llm.structured.bind(llm);
+    llm.structured = async function (req) {
+      if (req.schemaName === "extraction") {
+        reached();
+        await gate;
+        return req.schema.parse({ memories: [{ text: "User's dog is named Rex.", linked_refs: [] }] });
+      }
+      return original(req);
+    };
+
+    const extracting = extractFromThread(deps, thread.id);
+    await atLlm;
+
+    llm.push(step({ intent: "done_for_now", message: "and he is three" }));
+    deps.store.appendEvent(thread.id, "human_response", { response: "he is three years old" });
+    const resumed = await withThreadLock(thread.id, () => agentLoop(thread.id, deps));
+    release();
+    await extracting;
+
+    const final = deps.store.getThread(thread.id);
+    // Seqs stay dense and ordered — no interleaved or lost append.
+    expect(final.events.map(e => e.seq)).toEqual(final.events.map((_, i) => i));
+    // The annotation landed but did not change what the thread is waiting for.
+    expect(final.events.some(e => e.type === "memory_write")).toBe(true);
+    expect(deriveStatus(final)).toBe("awaiting_human");
+    expect(final.events.filter(e => e.type === "error")).toEqual([]);
+    expect(resumed.events.length).toBeLessThanOrEqual(final.events.length);
+  });
+
+  test("a crash between claiming a wake and recording it does not lose the wake", async () => {
+    const { deps, llm } = testWorld({
+      script: [step({ intent: "sleep_until", delay_minutes: 30, reason: "check the deploy" })],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "check the deploy in 30 minutes");
+    await agentLoop(thread.id, deps);
+
+    // Simulate the crash window: a previous process leased the row, then died
+    // before recording the wake. The row must still be fired = 0 — that is the
+    // whole point of the lease replacing the old fired-up-front claim.
+    const due = new Date(Date.now() + 45 * 60_000);
+    deps.db
+      .query("UPDATE schedules SET claimed_at = ? WHERE thread_id = ?")
+      .run(due.toISOString(), thread.id);
+    const row = deps.db.query("SELECT fired FROM schedules WHERE thread_id = ?").get(thread.id) as {
+      fired: number;
+    };
+    expect(row.fired).toBe(0);
+
+    // While the lease is live, another ticker leaves it alone.
+    expect(await tickScheduler(deps, id => agentLoop(id, deps), due)).toBe(0);
+
+    // Once the lease expires, the wake is reclaimed and delivered — not lost.
+    llm.push(step({ intent: "done_for_now", message: "deploy looks healthy" }));
+    const afterLease = new Date(due.getTime() + WAKE_LEASE_MS + 1000);
+    expect(await tickScheduler(deps, id => agentLoop(id, deps), afterLease)).toBe(1);
+    const woken = deps.store.getThread(thread.id);
+    expect(woken.events.filter(e => e.type === "system_note").length).toBe(1);
+    expect(woken.events.filter(e => e.type === "error")).toEqual([]);
+  });
+
+  test("startup releases stale leases so a reclaim does not wait out the lease", async () => {
+    const { deps, llm } = testWorld({
+      script: [step({ intent: "sleep_until", delay_minutes: 30, reason: "hourly check" })],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "check hourly");
+    await agentLoop(thread.id, deps);
+
+    const due = new Date(Date.now() + 45 * 60_000);
+    deps.db.query("UPDATE schedules SET claimed_at = ? WHERE thread_id = ?").run(due.toISOString(), thread.id);
+
+    const recovery = recoverPendingWakes(deps);
+    expect(recovery.released).toBe(1);
+    expect(recovery.incomplete).toEqual([]);
+
+    // Immediately claimable now — no lease wait.
+    llm.push(step({ intent: "done_for_now", message: "checked" }));
+    expect(await tickScheduler(deps, id => agentLoop(id, deps), due)).toBe(1);
+  });
+
+  test("a wake recorded but never completed is picked up for resume at startup", async () => {
+    const { deps } = testWorld({
+      script: [step({ intent: "sleep_until", delay_minutes: 30, reason: "resume me" })],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "wake me later");
+    await agentLoop(thread.id, deps);
+
+    // The wake commits, then the process dies before the loop appends anything.
+    const crashingLoop = async () => {
+      throw new Error("process died mid-turn");
+    };
+    await tickScheduler(deps, crashingLoop, new Date(Date.now() + 45 * 60_000));
+
+    const stalled = deps.store.getThread(thread.id);
+    expect(stalled.events[stalled.events.length - 1]!.type).toBe("system_note"); // wake recorded
+    expect(deriveStatus(stalled)).toBe("sleeping"); // ...but nothing ran after it
+    const rows = deps.db.query("SELECT fired FROM schedules WHERE thread_id = ?").all(thread.id) as Array<{
+      fired: number;
+    }>;
+    expect(rows.every(r => r.fired === 1)).toBe(true); // no tick will ever revisit it
+
+    // Without recovery this thread sleeps forever; recovery flags it for resume.
+    expect(recoverPendingWakes(deps).incomplete).toEqual([thread.id]);
+  });
+
+  test("ENGRAM_API_TOKEN gates every route except /health; unset stays open", async () => {
+    const { deps } = testWorld();
+    deps.config.port = 0;
+    deps.config.apiToken = "s3cret-token";
+    const { createServer } = await import("../src/server/routes");
+    const server = createServer(deps);
+    const base = `http://localhost:${server.port}`;
+    try {
+      // Health stays reachable so a probe does not need the secret.
+      expect((await fetch(`${base}/health`)).status).toBe(200);
+
+      expect((await fetch(`${base}/threads`)).status).toBe(401);
+      const wrong = await fetch(`${base}/threads`, { headers: { authorization: "Bearer nope" } });
+      expect(wrong.status).toBe(401);
+      // A prefix of the real token must not pass either.
+      const prefix = await fetch(`${base}/threads`, { headers: { authorization: "Bearer s3cret" } });
+      expect(prefix.status).toBe(401);
+
+      const ok = await fetch(`${base}/threads`, { headers: { authorization: "Bearer s3cret-token" } });
+      expect(ok.status).toBe(200);
+      // The scheme token is case-insensitive per RFC 7235.
+      const lower = await fetch(`${base}/threads`, { headers: { authorization: "bearer s3cret-token" } });
+      expect(lower.status).toBe(200);
+
+      // Writes are gated too, not just reads.
+      const write = await fetch(`${base}/threads`, {
+        method: "POST",
+        body: JSON.stringify({ message: "hi", user_id: "u1" }),
+      });
+      expect(write.status).toBe(401);
+    } finally {
+      await server.stop(true);
+    }
+
+    // Default config leaves the API open (documented local-first behavior).
+    const open = testWorld();
+    open.deps.config.port = 0;
+    expect(open.deps.config.apiToken).toBe("");
+    const openServer = createServer(open.deps);
+    try {
+      expect((await fetch(`http://localhost:${openServer.port}/threads`)).status).toBe(200);
+    } finally {
+      await openServer.stop(true);
     }
   });
 

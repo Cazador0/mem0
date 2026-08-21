@@ -6,6 +6,7 @@ import {
   eventAsStep,
   type Thread,
 } from "./thread";
+import { evaluateGateResults } from "../orchestration/gates";
 import type { EngramDeps } from "../deps";
 
 /**
@@ -118,6 +119,28 @@ export async function executeStep(
       }
       const result = deps.archival.delete(id, thread.agentId);
       return { intent: step.intent, ok: result.ok, result: result.message };
+    }
+
+    case "propose_plan": {
+      // The gate runs in CODE, not in the prompt (constitution IV): an
+      // unjustified failure — or a gate against an invented principle — comes
+      // back as an ok:false tool_response, so the model revises the plan
+      // instead of proceeding on a plan that violated a principle.
+      const evaluation = evaluateGateResults(
+        step.gate_results,
+        deps.constitution.principles.map(p => p.title),
+      );
+      if (!evaluation.ok) {
+        return { intent: step.intent, ok: false, result: evaluation.errors.join(" | ") };
+      }
+      return {
+        intent: step.intent,
+        ok: true,
+        result:
+          `plan accepted: ${step.steps.length} step(s), ` +
+          `${step.gate_results.length} constitution gate(s) evaluated, ` +
+          `${step.gate_results.filter(g => !g.pass).length} justified exception(s)`,
+      };
     }
 
     case "spawn_subagent": {

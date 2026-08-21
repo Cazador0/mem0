@@ -8,7 +8,8 @@
     "dev": "bun run src/index.ts",
     "chat": "bun run src/cli.ts",
     "test": "bun test",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "bunx tsc --noEmit",
+    "bench:entities": "bun scripts/bench-entity-recall.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

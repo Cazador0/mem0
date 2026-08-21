@@ -7,7 +7,15 @@
 
 export const ENTITY_BOOST_WEIGHT = 0.5;
 
-/** Longer queries yield higher raw BM25 scores; adapt the sigmoid accordingly. */
+/**
+ * Longer queries yield higher raw BM25 scores; adapt the sigmoid accordingly.
+ *
+ * Term counting deliberately follows mem0-ts, not mem0-py: the Python path
+ * counts LEMMATIZED, stopword-stripped tokens (spaCy), so "what is the user's
+ * favorite color" is ~3 terms there and 6 here — a different sigmoid row. We
+ * have no lemmatizer, which is exactly mem0-ts's fallback path. Do not "fix"
+ * this against main.py without adding lemmatization first.
+ */
 export function getBm25Params(query: string): [midpoint: number, steepness: number] {
   const numTerms = query.trim().split(/\s+/).filter(Boolean).length || 1;
   if (numTerms <= 3) return [5.0, 0.7];

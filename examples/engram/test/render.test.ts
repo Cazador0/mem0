@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { testWorld } from "./harness";
+import { step, testWorld } from "./harness";
 import { outwardText, renderEvent, renderUserMessage } from "../src/agent/render";
 import { evaluateGateResults, loadConstitution } from "../src/orchestration/gates";
+import { agentLoop } from "../src/agent/loop";
+import { buildSystemPrompt } from "../src/prompts/nextstep";
 import type { ThreadEvent } from "../src/agent/thread";
 
 function event(type: ThreadEvent["type"], data: unknown, seq = 0): ThreadEvent {
@@ -73,5 +75,116 @@ describe("constitution + gates", () => {
       { principle: "Local-first, one artifact", pass: false, justification: "external vector DB required at >100k memories" },
     ]);
     expect(justified.ok).toBe(true);
+  });
+});
+
+describe("constitution gate wiring (spec-kit justify-or-ERROR)", () => {
+  test("the constitution's principles parse into the gate vocabulary", () => {
+    const { deps } = testWorld();
+    const titles = deps.constitution.principles.map(p => p.title);
+    expect(deps.constitution.principles.length).toBe(7);
+    expect(deps.constitution.principles[0]!.id).toBe("I");
+    expect(titles).toContain("The LLM proposes, code disposes");
+  });
+
+  test("an unjustified gate failure is rejected and handed back for revision", async () => {
+    const { deps, llm } = testWorld({
+      script: [
+        step({
+          intent: "propose_plan",
+          summary: "Bulk-delete stale memories without approval",
+          steps: ["scan archival", "delete everything older than a year"],
+          gate_results: [{ principle: "The LLM proposes, code disposes", pass: false }],
+        }),
+        step({
+          intent: "propose_plan",
+          summary: "Propose deletions, let the human approve each",
+          steps: ["scan archival", "propose deletions one at a time"],
+          gate_results: [
+            { principle: "The LLM proposes, code disposes", pass: true },
+            {
+              principle: "The event log is canonical and append-only",
+              pass: false,
+              justification: "compaction is read-side only; the log is untouched",
+            },
+          ],
+        }),
+        step({ intent: "done_for_now", message: "plan ready" }),
+      ],
+    });
+    const thread = deps.store.createThread("engram", { userId: "u1", agentId: "engram" });
+    deps.store.appendEvent(thread.id, "user_input", "clean up my old memories");
+    const finished = await agentLoop(thread.id, deps);
+
+    const responses = finished.events
+      .filter(e => e.type === "tool_response")
+      .map(e => e.data as { ok: boolean; result: string });
+    // First plan: failing gate with no justification -> rejected, in code.
+    expect(responses[0]!.ok).toBe(false);
+    expect(responses[0]!.result).toContain("without justification");
+    // Revised plan: the failure now carries a justification -> accepted.
+    expect(responses[1]!.ok).toBe(true);
+    expect(responses[1]!.result).toContain("1 justified exception");
+    expect(finished.events.filter(e => e.type === "error")).toEqual([]);
+    expect(llm.calls.filter(c => c === "next_step_envelope").length).toBe(3);
+  });
+
+  test("a gate against an invented principle is rejected", () => {
+    const { deps } = testWorld();
+    const known = deps.constitution.principles.map(p => p.title);
+    const invented = evaluateGateResults([{ principle: "Move fast", pass: true }], known);
+    expect(invented.ok).toBe(false);
+    expect(invented.errors[0]).toContain("unknown constitution principle");
+    // Without the vocabulary the check is skipped (the module stays reusable).
+    expect(evaluateGateResults([{ principle: "Move fast", pass: true }]).ok).toBe(true);
+  });
+
+  test("the prompt names the principles but never inlines the constitution body", () => {
+    const { deps } = testWorld();
+    const prompt = buildSystemPrompt({
+      agentPersona: "p",
+      constitutionVersion: deps.constitution.version,
+      constitutionDigest: deps.constitution.digest,
+      principles: deps.constitution.principles.map(p => p.title),
+      intents: ["propose_plan", "done_for_now"],
+      coreBlocks: "",
+    });
+    expect(prompt).toContain("The LLM proposes, code disposes");
+    // Pointer-not-copy (spec §8e): the body text stays out of the prompt.
+    expect(prompt.length).toBeLessThan(deps.constitution.content.length);
+    expect(prompt).not.toContain("MUST");
+  });
+});
+
+describe("system prompt (the cached stable prefix)", () => {
+  const build = (intents: Parameters<typeof buildSystemPrompt>[0]["intents"]) =>
+    buildSystemPrompt({
+      agentPersona: "PERSONA-MARKER",
+      constitutionVersion: "1.0.0",
+      constitutionDigest: "abc123",
+      intents,
+      coreBlocks: "<core_block label=\"human\">BLOCK-MARKER</core_block>",
+    });
+
+  test("sections stay in cache-stable order: identity -> constitution -> persona -> intents -> core", () => {
+    const prompt = build(["archival_search", "done_for_now"]);
+    const order = [
+      prompt.indexOf("You are an Engram agent"),
+      prompt.indexOf("Project constitution v1.0.0"),
+      prompt.indexOf("PERSONA-MARKER"),
+      prompt.indexOf("# Available intents"),
+      prompt.indexOf("BLOCK-MARKER"),
+    ];
+    expect(order.every(i => i >= 0)).toBe(true);
+    // Volatile content last: reordering these breaks prompt-cache hit rates.
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(prompt).toContain("digest abc123");
+  });
+
+  test("only the agent's own intents are documented (capability = presence)", () => {
+    const prompt = build(["archival_search", "done_for_now"]);
+    expect(prompt).toContain("`archival_search`");
+    expect(prompt).not.toContain("`spawn_subagent`");
+    expect(prompt).not.toContain("`memory_delete`");
   });
 });

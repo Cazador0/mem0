@@ -3,6 +3,15 @@ import { conversationalText } from "./recall";
 import { withThreadLock } from "../orchestration/lock";
 import { buildExtractionUser, EXTRACTION_SYSTEM, ExtractionSchema } from "../prompts/extraction";
 
+/** Runs that may hold the watermark for a retry before giving up on an item. */
+export const MAX_EXTRACTION_ATTEMPTS = 2;
+
+export interface ExtractionOutcome {
+  added: Array<{ id: string; memory: string }>;
+  /** Per-item insert failures in this run (0 on a clean run). */
+  failures: number;
+}
+
 /**
  * The archival write pipeline — mem0's V3 phased, ADD-only design. Runs after
  * a loop pass (never inline in it). Numbered phases with per-item resilience;
@@ -20,7 +29,7 @@ import { buildExtractionUser, EXTRACTION_SYSTEM, ExtractionSchema } from "../pro
 export async function extractFromThread(
   deps: EngramDeps,
   threadId: string,
-): Promise<{ added: Array<{ id: string; memory: string }> }> {
+): Promise<ExtractionOutcome> {
   // Serialized per thread under a dedicated "extract:" lock namespace: two
   // background extractions must never snapshot the same watermark (the second
   // would re-process the first's messages and could regress extracted_seq).
@@ -33,7 +42,7 @@ export async function extractFromThread(
 async function extractLocked(
   deps: EngramDeps,
   threadId: string,
-): Promise<{ added: Array<{ id: string; memory: string }> }> {
+): Promise<ExtractionOutcome> {
   const thread = deps.store.getThread(threadId);
   const scope = { userId: thread.userId, agentId: thread.agentId, runId: thread.runId };
 
@@ -44,7 +53,7 @@ async function extractLocked(
     const line = conversationalText(event);
     if (line?.text.trim()) newMessages.push({ ...line, seq: event.seq, ts: event.ts });
   }
-  if (newMessages.length === 0) return { added: [] };
+  if (newMessages.length === 0) return { added: [], failures: 0 };
 
   // Already-processed context for pronoun resolution: the shared rolling
   // window over the sub-thread of events at or below the watermark.
@@ -80,6 +89,7 @@ async function extractLocked(
   // Phases 3-7 — per-memory insert; unknown refs are dropped (constitution IV).
   const sourceSeqs = newMessages.map(m => m.seq);
   const added: Array<{ id: string; memory: string }> = [];
+  let failures = 0;
   for (const memory of extraction.memories) {
     const links = memory.linked_refs
       .map(ref => refToId.get(ref))
@@ -94,6 +104,7 @@ async function extractLocked(
       });
       if (result.created) added.push({ id: result.id, memory: memory.text });
     } catch (err) {
+      failures++;
       console.warn(`[engram] archival insert failed for one memory (continuing): ${(err as Error).message}`);
     }
   }
@@ -109,7 +120,31 @@ async function extractLocked(
     });
   }
   const snapshotMaxSeq = thread.events.reduce((max, e) => Math.max(max, e.seq), thread.extractedSeq);
-  deps.store.setExtractedSeq(thread.id, snapshotMaxSeq);
 
-  return { added };
+  if (failures === 0) {
+    deps.store.setExtractedSeq(thread.id, snapshotMaxSeq);
+    if (deps.store.extractFailures(thread.id) > 0) deps.store.setExtractFailures(thread.id, 0);
+    return { added, failures };
+  }
+
+  // Partial failure: HOLD the watermark so the next run re-extracts this window
+  // and the lost memories get another chance (hash dedup absorbs the ones that
+  // did store, so a retry is cheap). Bounded, because a permanently-failing
+  // item would otherwise re-extract this window forever.
+  const attempt = deps.store.extractFailures(thread.id) + 1;
+  if (attempt < MAX_EXTRACTION_ATTEMPTS) {
+    deps.store.setExtractFailures(thread.id, attempt);
+    console.warn(
+      `[engram] ${failures} memories failed to store — holding the extraction watermark ` +
+        `for retry (attempt ${attempt}/${MAX_EXTRACTION_ATTEMPTS})`,
+    );
+    return { added, failures };
+  }
+  deps.store.setExtractedSeq(thread.id, snapshotMaxSeq);
+  deps.store.setExtractFailures(thread.id, 0);
+  console.warn(
+    `[engram] giving up on ${failures} memories after ${attempt} attempts — advancing the ` +
+      `extraction watermark so the thread does not re-extract this window forever`,
+  );
+  return { added, failures };
 }

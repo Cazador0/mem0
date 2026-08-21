@@ -41,6 +41,8 @@ export function createServer(deps: EngramDeps) {
     port: deps.config.port,
     fetch: async req => {
       try {
+        const denied = authorize(req, deps);
+        if (denied) return denied;
         return await route(req, deps);
       } catch (err) {
         const message = (err as Error).message ?? String(err);
@@ -53,6 +55,34 @@ export function createServer(deps: EngramDeps) {
       }
     },
   });
+}
+
+/**
+ * Opt-in bearer auth. Unset token = open, which is the local-first default and
+ * the documented threat model; when a token IS set, everything except the
+ * health probe requires it. Comparison is length-safe and constant-time-ish:
+ * a mismatch never short-circuits on the first differing byte.
+ */
+function authorize(req: Request, deps: EngramDeps): Response | null {
+  const expected = deps.config.apiToken;
+  if (!expected) return null;
+  if (new URL(req.url).pathname === "/health") return null;
+
+  // RFC 7235: the auth scheme is case-insensitive, so accept "bearer" too
+  // rather than 401-ing a correct token over capitalization.
+  const header = req.headers.get("authorization") ?? "";
+  const presented = /^bearer /i.test(header) ? header.slice(7) : "";
+  if (!secretsEqual(presented, expected)) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  return null;
+}
+
+function secretsEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 async function route(req: Request, deps: EngramDeps): Promise<Response> {

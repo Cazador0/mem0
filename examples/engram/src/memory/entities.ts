@@ -23,7 +23,19 @@ const STOPWORDS = new Set([
   "user", "agent", "assistant", "when", "what", "where", "who", "why", "how",
 ]);
 
-export function extractEntities(text: string): ExtractedEntity[] {
+export interface ExtractOptions {
+  /**
+   * Also treat a lone capitalized word at the start of a line as a proper
+   * noun. OFF for indexing (a line-initial single capital is usually just a
+   * sentence starter — "Also…", "Yesterday…" — and indexing those fills the
+   * index with junk) and ON for queries, where the whole query is very often
+   * exactly one name: "Poppy". A spurious query entity costs nothing (it
+   * matches no indexed row); a missed one costs the entire boost.
+   */
+  lineInitialSingles?: boolean;
+}
+
+export function extractEntities(text: string, opts: ExtractOptions = {}): ExtractedEntity[] {
   const seen = new Map<string, ExtractedEntity>();
   const add = (raw: string, entityType: EntityType) => {
     const data = raw.trim().replace(/\s+/g, " ");
@@ -43,6 +55,9 @@ export function extractEntities(text: string): ExtractedEntity[] {
   }
   for (const m of text.matchAll(/^\b(\p{Lu}[\p{L}\p{N}]+\s+\p{Lu}[\p{L}\p{N}]+(?:\s+\p{Lu}[\p{L}\p{N}]+)*)\b/gmu)) {
     add(m[1] ?? "", "PROPER");
+  }
+  if (opts.lineInitialSingles) {
+    for (const m of text.matchAll(/^\b(\p{Lu}[\p{L}\p{N}]+)\b/gmu)) add(m[1] ?? "", "PROPER");
   }
   // Technical identifiers: snake_case, kebab-case, dotted.paths, camelCase.
   for (const m of text.matchAll(/\b([\p{L}\p{N}]+(?:[._-][\p{L}\p{N}]+)+|\b\p{Ll}+\p{Lu}[\p{L}\p{N}]*)\b/gu)) {
@@ -124,7 +139,9 @@ export class EntityIndex {
   boostsForQuery(query: string, scope: Scope): Record<string, number> {
     const boosts: Record<string, number> = {};
     try {
-      for (const entity of extractEntities(query).slice(0, 8)) {
+      // Read side is permissive (see ExtractOptions): the most natural query a
+      // human types is the bare name, which the indexing heuristic skips.
+      for (const entity of extractEntities(query, { lineInitialSingles: true }).slice(0, 8)) {
         // Read side filters on supplied scope keys only (mem0 subset
         // semantics, mirroring ArchivalMemory.search) — the same entity may
         // exist as separate rows under different writer identities.

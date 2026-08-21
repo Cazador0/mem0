@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { GateResultSchema } from "../orchestration/gates";
 
 /**
  * The intent union — 12-factor factor 4: tools are structured outputs. Every
@@ -91,6 +92,16 @@ export const SpawnSubagent = z.object({
   task: z.string().min(1),
 });
 
+export const ProposePlan = z.object({
+  intent: z.literal("propose_plan"),
+  summary: z.string().min(1),
+  steps: z.array(z.string().min(1)).min(1).max(10),
+  gate_results: z
+    .array(GateResultSchema)
+    .min(1)
+    .describe("One entry per constitution principle the plan touches; failures need a justification"),
+});
+
 export const DoneForNow = z.object({
   intent: z.literal("done_for_now"),
   message: z.string().min(1),
@@ -112,6 +123,7 @@ export const INTENT_SCHEMAS = {
   memory_delete: MemoryDelete,
   request_human_input: RequestHumanInput,
   needs_clarification: NeedsClarification,
+  propose_plan: ProposePlan,
   sleep_until: SleepUntil,
   spawn_subagent: SpawnSubagent,
   done_for_now: DoneForNow,
@@ -131,6 +143,7 @@ export const NextStepSchema = z.discriminatedUnion("intent", [
   MemoryDelete,
   RequestHumanInput,
   NeedsClarification,
+  ProposePlan,
   SleepUntil,
   SpawnSubagent,
   DoneForNow,
@@ -171,6 +184,7 @@ export function routeIntent(step: NextStep): Route {
     case "recall_search":
     case "memory_update":
     case "spawn_subagent":
+    case "propose_plan":
       return "sync";
     case "memory_delete":
       return "gated";
@@ -194,6 +208,7 @@ export const INTENT_DOCS: Record<IntentName, string> = {
   memory_update: "Rewrite a previously returned archival memory. ref MUST be an integer ref from an archival_search result earlier in this thread.",
   memory_delete: "Delete a previously returned archival memory. Requires human approval before execution; deletion is soft in the audit history.",
   request_human_input: "Ask the human a question and pause until they respond.",
+  propose_plan: "Propose a plan BEFORE non-trivial work: summary, up to 10 steps, and one gate_result per constitution principle the plan touches ({principle, pass, justification?}). A failing gate without a justification is rejected and returned to you — adjust the plan, never the principle.",
   needs_clarification: "Raise up to 3 clarification markers (each with 2-5 options and a recommended choice) and pause. Use during planning when a choice materially changes scope, security, or UX.",
   sleep_until: "Pause durably and wake at a time (wake_at RFC3339 or delay_minutes — provide exactly one).",
   spawn_subagent: "Delegate a focused task to a specialist agent on a fresh thread; you receive only its verdict and top findings.",

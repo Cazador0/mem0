@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { FakeEmbedder, testWorld } from "./harness";
-import { closeDb, openDb } from "../src/db/database";
+import { closeDb, openDb, probeFts5 } from "../src/db/database";
+import { mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ArchivalMemory } from "../src/memory/archival";
 import { EntityIndex, extractEntities } from "../src/memory/entities";
 import { crowdPenalty, ENTITY_BOOST_WEIGHT, getBm25Params, scoreAndRank } from "../src/memory/scoring";
-import { buildScopeKey, stripIdentityKeys } from "../src/memory/recall";
+import { buildScopeKey, RecallStore, stripIdentityKeys } from "../src/memory/recall";
 
 const SCOPE = { userId: "u1", agentId: "engram", runId: "" };
 
@@ -24,6 +27,86 @@ describe("database bootstrap", () => {
     // capability detection); on a build without FTS5 openDb throws a named error.
     closeDb(db); // checkpoint + close must not throw
     expect(() => db.query("SELECT 1").get()).toThrow(); // really closed
+  });
+
+  test("the FTS5 probe fails loudly with the remedy when the build lacks FTS5", () => {
+    // The real failure only happens where Bun dlopens a system SQLite without
+    // FTS5 (macOS), so drive the probe with a stub to cover the branch here.
+    const stub = {
+      run(sql: string) {
+        if (sql.includes("fts5")) throw new Error("no such module: fts5");
+        return undefined;
+      },
+    };
+    expect(() => probeFts5(stub)).toThrow(/no FTS5 support/);
+    expect(() => probeFts5(stub)).toThrow(/setCustomSQLite/); // names the remedy
+  });
+
+  test("an existing database upgrades in place and re-migrating is a no-op", () => {
+    const dir = mkdtempSync(join(tmpdir(), "engram-migrate-"));
+    const path = join(dir, "engram.sqlite");
+    try {
+      const first = openDb(path);
+      const store = new RecallStore(first);
+      const thread = store.createThread("engram", SCOPE);
+      store.appendEvent(thread.id, "user_input", "a memory from before the upgrade");
+
+      // Rewind to the pre-lease schema: this is the shape an engram.sqlite
+      // created by an earlier version actually has on disk.
+      first.run("DELETE FROM migrations WHERE name IN ('003_schedule_lease.sql', '004_extract_failures.sql')");
+      first.run("DROP INDEX IF EXISTS idx_schedules_claim");
+      first.run("ALTER TABLE schedules DROP COLUMN claimed_at");
+      first.run("ALTER TABLE threads DROP COLUMN extract_failures");
+      closeDb(first);
+
+      // Re-opening must add the columns without touching the existing rows.
+      const upgraded = openDb(path);
+      const names = (upgraded.query("SELECT name FROM migrations").all() as Array<{ name: string }>).map(r => r.name);
+      expect(names).toContain("003_schedule_lease.sql");
+      expect(names).toContain("004_extract_failures.sql");
+
+      const store2 = new RecallStore(upgraded);
+      const reloaded = store2.getThread(thread.id);
+      expect(reloaded.events.length).toBe(1); // data survived
+      expect(store2.extractFailures(thread.id)).toBe(0); // new column defaulted
+      closeDb(upgraded);
+
+      // Idempotent: a second open must not re-run ALTER (duplicate column).
+      const again = openDb(path);
+      const count = again.query("SELECT COUNT(*) AS n FROM migrations").get() as { n: number };
+      expect(count.n).toBe(4);
+      closeDb(again);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("closeDb checkpoints the WAL so no sidecar outlives the process", () => {
+    // The one place a test may touch a real file: a throwaway temp database,
+    // because WAL sidecar behavior cannot be observed in :memory:.
+    const dir = mkdtempSync(join(tmpdir(), "engram-wal-"));
+    const path = join(dir, "engram.sqlite");
+    try {
+      const db = openDb(path);
+      const store = new RecallStore(db);
+      const thread = store.createThread("engram", SCOPE);
+      store.appendEvent(thread.id, "user_input", "write something into the WAL");
+      expect(statSync(`${path}-wal`).size).toBeGreaterThan(0); // WAL is live pre-close
+
+      closeDb(db);
+      // TRUNCATE checkpoint folds the WAL back into the main file: the sidecar
+      // is gone or empty, so reopening never depends on leftover state.
+      const walGone = !existsSync(`${path}-wal`) || statSync(`${path}-wal`).size === 0;
+      expect(walGone).toBe(true);
+
+      // The data itself survived the checkpoint.
+      const reopened = openDb(path);
+      const rows = reopened.query("SELECT COUNT(*) AS n FROM events").get() as { n: number };
+      expect(rows.n).toBe(1);
+      closeDb(reopened);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -274,6 +357,25 @@ describe("entity side-index", () => {
     expect(names).toContain("Poppy");
     expect(names).toContain("morning laps");
     expect(names).toContain("fitness_tracker.app");
+  });
+
+  test("a bare entity name — the most natural query there is — fires the boost", async () => {
+    const { deps } = testWorld();
+    const { id } = await deps.archival.insert({ content: "User's dog is named Poppy.", scope: SCOPE });
+    const index = new EntityIndex(deps.db);
+
+    // Mid-sentence phrasing always worked, which is why this gap survived four
+    // review rounds: every prior test asked "Tell me about Poppy".
+    expect(index.boostsForQuery("Tell me about Poppy", SCOPE)[id]).toBeGreaterThan(0);
+    // The bare name is the case the indexing heuristic's sentence-starter guard
+    // used to swallow entirely.
+    expect(index.boostsForQuery("Poppy", SCOPE)[id]).toBeGreaterThan(0);
+    expect(index.boostsForQuery("Poppy's walk", SCOPE)[id]).toBeGreaterThan(0);
+
+    // Indexing stays conservative — a sentence starter must not become an entity.
+    expect(extractEntities("Also my cat is hungry").map(e => e.data)).not.toContain("Also");
+    // ...while the permissive query pass may produce it; harmless, it matches nothing.
+    expect(extractEntities("Also my cat is hungry", { lineInitialSingles: true }).map(e => e.data)).toContain("Also");
   });
 
   test("links memories and boosts them for entity queries, with unlink on delete", async () => {

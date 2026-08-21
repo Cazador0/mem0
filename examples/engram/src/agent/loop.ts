@@ -38,6 +38,7 @@ export async function agentLoop(threadId: string, deps: EngramDeps): Promise<Thr
         constitutionVersion: deps.constitution.version,
         constitutionDigest: deps.constitution.digest,
         intents: agent.intents,
+        principles: deps.constitution.principles.map(p => p.title),
         coreBlocks: deps.core.render(thread.agentId),
       });
       const user = renderUserMessage(thread, prefetched?.block ?? null);

@@ -134,6 +134,18 @@ export class RecallStore {
     this.db.query("UPDATE threads SET status_hint = ?, updated_at = ? WHERE id = ?").run(hint, nowIso(), threadId);
   }
 
+  /** Consecutive extraction runs that hit a per-item insert failure. */
+  extractFailures(threadId: string): number {
+    const row = this.db
+      .query("SELECT extract_failures AS n FROM threads WHERE id = ?")
+      .get(threadId) as { n: number } | null;
+    return row?.n ?? 0;
+  }
+
+  setExtractFailures(threadId: string, count: number): void {
+    this.db.query("UPDATE threads SET extract_failures = ? WHERE id = ?").run(count, threadId);
+  }
+
   setExtractedSeq(threadId: string, seq: number): void {
     // Monotonic: an extraction that snapshotted earlier but finished later must
     // never move the watermark backwards (that would re-process — and

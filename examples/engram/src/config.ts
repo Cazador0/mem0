@@ -12,6 +12,12 @@ export interface EngramConfig {
   /** Hard bound on LLM steps per loop entry (12-factor: small, focused agents). */
   maxSteps: number;
   port: number;
+  /**
+   * Bearer token required by the HTTP API. Empty = open (the local-first
+   * default); set ENGRAM_API_TOKEN to require `Authorization: Bearer <token>`
+   * on every route except /health.
+   */
+  apiToken: string;
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): EngramConfig {
@@ -24,5 +30,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     embeddingsDims: Number(env.ENGRAM_EMBEDDINGS_DIMS ?? 1536),
     maxSteps: Number(env.ENGRAM_MAX_STEPS ?? 20),
     port: Number(env.PORT ?? 7749),
+    apiToken: env.ENGRAM_API_TOKEN ?? "",
   };
 }
