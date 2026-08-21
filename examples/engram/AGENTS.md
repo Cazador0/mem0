@@ -55,6 +55,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/memory/scoring.ts` | Hybrid scoring (mem0 port): cosine, sigmoid-BM25, entity boost, adaptive divisor |
 | `src/memory/entities.ts` | Best-effort entity→memories inverted index (regex extractor, no NLP dep) |
 | `src/memory/extraction.ts` | mem0-V3 phased ADD-only pipeline; only its LLM phase throws; serialized per thread (`extract:` lock), monotonic watermark, bounded retry on partial insert failure |
+| `src/memory/compaction.ts` | Distills pre-tail events into a stored summary; render shows it instead of a bare marker |
 | `src/memory/prefetch.ts` | Deterministic memory injection at loop entry (12-factor appendix 13) |
 | `src/agent/thread.ts` | Thread/Event types, derived-status predicates, ref-map reconstruction |
 | `src/agent/intents.ts` | The Zod intent union + routing table + per-agent subsetting |

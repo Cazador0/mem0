@@ -49,6 +49,11 @@ sleep's wake is consumed as stale instead of waking the newer sleep early):
   startup) and a duplicate delivery appends nothing. A crash *after* the note
   but before the loop finishes is reconciled by `recoverPendingWakes` at
   startup.
+- `compactions` — distillate of a thread's pre-tail events, keyed
+  `(thread_id, up_to_seq)` so compaction is idempotent per boundary (005). The
+  summary lives here rather than in the event log (whose vocabulary is closed)
+  or the archival store (which is cross-thread, where half a conversation could
+  surface in an unrelated search).
 - `artifacts` — registry for capsule/artifact handoffs *(roadmap: capsule compiler)*.
 
 **Scope semantics** (mem0 parity): writes store the full thread identity
@@ -92,7 +97,7 @@ engram/
 ├── src/
 │   ├── index.ts / cli.ts / bootstrap.ts / config.ts / deps.ts
 │   ├── db/database.ts + db/migrations/{001_init,002_schedule_sleep_seq}.sql
-│   ├── memory/{core,recall,archival,scoring,entities,embeddings,extraction,prefetch,procedural}.ts
+│   ├── memory/{core,recall,archival,scoring,entities,embeddings,extraction,prefetch,procedural,compaction}.ts
 │   ├── prompts/{extraction,nextstep}.ts        # every LLM-facing template in one place
 │   ├── agent/{thread,intents,loop,execute,render,llm,approval}.ts
 │   ├── channels/cli-turn.ts                    # CLI channel core; src/cli.ts is I/O only
@@ -163,35 +168,6 @@ losers fail loudly, but the log would still record a garbled conversation).
   with asymmetric context envelopes; section-level write permissions enforced in code.
 - **CLAUDE.md generator** (`context/claudemd.ts`): marker-region upsert handling
   all four corruption states, manifest-hash ownership, pointer-not-copy content.
-- **Render-seam compaction**: today everything beyond the 50-event verbatim tail
-  is elided behind a marker pointing at `recall_search`, which recovers keyword
-  hits but not mid-thread commitments. 12-factor's stored-vs-rendered doctrine
-  sanctions summarizing the elided region; BMAD's distillator supplies the
-  contract (compression-not-summarization; never drop decisions, rejected
-  alternatives, open questions, constraints; completeness checks). The obvious
-  next feature for long-lived threads.
-
-  **Open design question, to settle before building it.** Summarizing needs an
-  LLM call, but `render.ts` is deliberately pure and synchronous — the seam must
-  not acquire a network dependency, and rendering must never mutate the log
-  (constitution I). The summary therefore has to be produced elsewhere and only
-  READ at render time. Three candidate homes, none free:
-  1. **An event** (a `compaction` type). Natural for an append-only log and it
-     survives restarts, but the event vocabulary is closed: adding a type means
-     updating every derived-status predicate and `render.ts` in the same change,
-     and it must behave as an annotation (like `memory_write`) or it will change
-     what threads appear to be waiting for.
-  2. **An archival memory** (`memoryType: "procedural"`, metadata naming the
-     thread and covered seq range) — reuses `procedural.ts` and its audit trail,
-     but puts thread-local context into the cross-thread store, where a later
-     `archival_search` could surface half a conversation to an unrelated thread.
-  3. **A dedicated `compactions` table** keyed by `(thread_id, up_to_seq)` — the
-     cleanest separation and the easiest to invalidate, at the cost of a fourth
-     storage shape plus a migration.
-
-  Whichever wins: compaction must be triggered from the loop (where awaits are
-  allowed), be idempotent per `up_to_seq`, and leave the canonical events intact
-  so `recall_search` still reaches the originals.
 - **Statement-cache trim**: precompile the hot path (appendEvent, search) as a
   fixed set of ≤20 `db.query()` statements; move the long tail to `prepare()`.
 

@@ -11,6 +11,7 @@ import { executeStep } from "./execute";
 import { compactError, renderUserMessage } from "./render";
 import { buildSystemPrompt } from "../prompts/nextstep";
 import { prefetchArchival } from "../memory/prefetch";
+import { compactIfNeeded } from "../memory/compaction";
 import { summarizeRun } from "../memory/procedural";
 import { scheduleWake } from "../orchestration/scheduler";
 import type { EngramDeps } from "../deps";
@@ -40,6 +41,8 @@ export async function agentLoop(threadId: string, deps: EngramDeps): Promise<Thr
     let step: NextStep;
     try {
       const prefetched = await prefetchArchival(deps, thread).catch(() => null);
+      // Both are read-side context production, both degrade to null.
+      const compacted = await compactIfNeeded(deps, thread).catch(() => null);
       const system = buildSystemPrompt({
         agentPersona: agent.persona,
         constitutionVersion: deps.constitution.version,
@@ -48,7 +51,7 @@ export async function agentLoop(threadId: string, deps: EngramDeps): Promise<Thr
         principles: deps.constitution.principles.map(p => p.title),
         coreBlocks: deps.core.render(thread.agentId),
       });
-      const user = renderUserMessage(thread, prefetched?.block ?? null);
+      const user = renderUserMessage(thread, prefetched?.block ?? null, compacted);
       const envelope = await deps.llm.structured({
         system,
         user,

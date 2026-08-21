@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { FakeEmbedder, testWorld } from "./harness";
-import { closeDb, openDb, probeFts5 } from "../src/db/database";
+import { closeDb, MIGRATIONS, openDb, probeFts5 } from "../src/db/database";
 import { mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -73,8 +73,10 @@ describe("database bootstrap", () => {
 
       // Idempotent: a second open must not re-run ALTER (duplicate column).
       const again = openDb(path);
+      // Compare against the real list, not a magic number: adding a migration
+      // must not break this, but applying one TWICE still must.
       const count = again.query("SELECT COUNT(*) AS n FROM migrations").get() as { n: number };
-      expect(count.n).toBe(4);
+      expect(count.n).toBe(MIGRATIONS.length);
       closeDb(again);
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -8,7 +8,7 @@ import { escapeAngleBrackets } from "./escape";
  * only (constitution I).
  */
 
-const VERBATIM_TAIL = 50;
+export const VERBATIM_TAIL = 50;
 const SECRET_KEY = /(api_?key|token|secret|password|authorization)/i;
 
 /** XML-ish per-event block: tag = data.intent || type, intent key stripped. */
@@ -52,23 +52,56 @@ function sanitizeForPrompt(value: unknown): unknown {
   return value;
 }
 
+/** A distillate of the events before `upToSeq` (see memory/compaction.ts). */
+export interface CompactedHistory {
+  summary: string;
+  upToSeq: number;
+  eventCount: number;
+}
+
 /**
  * The single user message: pre-fetched archival memories, then the thread —
- * older events elided behind a marker, resolved errors hidden (factor 9: only
- * the trailing error run still matters; earlier errors were healed).
+ * the compacted distillate of old events (when one exists), then anything after
+ * it verbatim, with resolved errors hidden (factor 9: only the trailing error
+ * run still matters; earlier errors were healed).
+ *
+ * Compaction is produced elsewhere and passed in, exactly like prefetch: this
+ * function stays pure and synchronous, and the canonical log is never mutated
+ * by rendering (constitution I).
  */
-export function renderUserMessage(thread: Thread, prefetchBlock: string | null): string {
+export function renderUserMessage(
+  thread: Thread,
+  prefetchBlock: string | null,
+  compaction: CompactedHistory | null = null,
+): string {
   const parts: string[] = [];
   if (prefetchBlock) parts.push(prefetchBlock);
 
   const visible = hideResolvedErrors(thread.events);
-  const elided = visible.length - VERBATIM_TAIL;
+  let remaining = visible;
+  if (compaction) {
+    remaining = visible.filter(event => event.seq > compaction.upToSeq);
+    // Only worth rendering if it actually replaced something on screen.
+    if (remaining.length < visible.length) {
+      parts.push(
+        `<compacted_history events="${compaction.eventCount}" through_seq="${compaction.upToSeq}">\n` +
+          `${escapeAngleBrackets(compaction.summary)}\n` +
+          `(compressed from ${compaction.eventCount} earlier events — the originals are intact; ` +
+          `use recall_search for exact wording)\n` +
+          `</compacted_history>`,
+      );
+    } else {
+      remaining = visible;
+    }
+  }
+
+  const elided = remaining.length - VERBATIM_TAIL;
   if (elided > 0) {
     parts.push(
       `<elided count="${elided}">older events not shown — use recall_search to retrieve details</elided>`,
     );
   }
-  for (const event of visible.slice(-VERBATIM_TAIL)) parts.push(renderEvent(event));
+  for (const event of remaining.slice(-VERBATIM_TAIL)) parts.push(renderEvent(event));
   parts.push("What should the next step be? Choose exactly one intent.");
   return parts.join("\n\n");
 }

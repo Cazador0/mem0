@@ -48,11 +48,13 @@ export function closeDb(db: Database): void {
   db.close();
 }
 
-const MIGRATIONS = [
+/** Applied in order, once each; the list is the schema history. */
+export const MIGRATIONS = [
   "001_init.sql",
   "002_schedule_sleep_seq.sql",
   "003_schedule_lease.sql",
   "004_extract_failures.sql",
+  "005_compactions.sql",
 ] as const;
 
 export function migrate(db: Database): void {
