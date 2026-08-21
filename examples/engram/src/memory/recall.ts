@@ -81,6 +81,36 @@ export const RECALL_SQL = {
 export class RecallStore {
   constructor(private readonly db: Database) {}
 
+  /**
+   * Append notifications, for channels that want to show progress while a turn
+   * runs (SSE). Deliberately minimal: subscribers are told an event landed,
+   * they are NOT a second write path, and a throwing subscriber can never fail
+   * an append — the log is the product, streaming is a view of it.
+   */
+  private readonly subscribers = new Map<string, Set<(event: ThreadEvent) => void>>();
+
+  subscribe(threadId: string, onEvent: (event: ThreadEvent) => void): () => void {
+    const set = this.subscribers.get(threadId) ?? new Set();
+    set.add(onEvent);
+    this.subscribers.set(threadId, set);
+    return () => {
+      set.delete(onEvent);
+      if (set.size === 0) this.subscribers.delete(threadId);
+    };
+  }
+
+  private publish(event: ThreadEvent): void {
+    const set = this.subscribers.get(event.threadId);
+    if (!set) return;
+    for (const cb of set) {
+      try {
+        cb(event);
+      } catch (err) {
+        console.warn(`[engram] event subscriber threw (ignored): ${(err as Error).message}`);
+      }
+    }
+  }
+
   createThread(agentId: string, scope: Scope): Thread {
     const id = Bun.randomUUIDv7();
     const now = nowIso();
@@ -141,7 +171,11 @@ export class RecallStore {
       return row.seq;
     });
     const seq = insert.immediate() as number;
-    return { id, threadId, seq, type, data: data ?? null, ts };
+    const event: ThreadEvent = { id, threadId, seq, type, data: data ?? null, ts };
+    // AFTER the transaction commits: a subscriber must never observe an event
+    // that could still roll back.
+    this.publish(event);
+    return event;
   }
 
   setStatusHint(threadId: string, hint: string): void {

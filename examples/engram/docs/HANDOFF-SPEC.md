@@ -120,13 +120,24 @@ engram/
 │   ├── evals/harness.ts                        # prompt evals: render + score via the loop's own path
 │   ├── agents/registry.ts
 │   ├── orchestration/{gates,scheduler,lock}.ts # lock = per-thread promise mutex
-│   └── server/routes.ts
+│   └── server/routes.ts                     # HTTP; the same turn streams as SSE on ?stream=1
 └── test/{harness,preload}.ts + *.test.ts
 ```
 
 Note that `prompts/` holds the two long system prompts, not literally every
 model-facing string: `agent/intents.ts` INTENT_DOCS is rendered verbatim into
 the system prompt, and `agent/llm.ts` composes the parse-retry feedback.
+
+`server/routes.ts` serves one turn in two presentations. The JSON view awaits
+the loop and returns `threadView`; `?stream=1` (or `Accept: text/event-stream`)
+returns an async-generator Response that emits `thread` → one `event` frame per
+committed log event → `done` carrying that same `threadView`. The frames come
+from `RecallStore`'s **post-commit** subscription, so a client can never observe
+an event that could still roll back, and the generator's `finally` releases the
+subscription on client disconnect. `server.timeout(req, 0)` is required: a
+multi-step turn outlives Bun's 10s default idle timeout. Streaming is strictly a
+view — it adds no second write path, and a throwing subscriber cannot fail an
+append.
 
 `orchestration/lock.ts` is load-bearing: **every** loop entry (HTTP create and
 resume, scheduler wakes, the CLI) runs under `withThreadLock(threadId, …)`, and
@@ -177,8 +188,9 @@ losers fail loudly, but the log would still record a garbled conversation).
   legacy `DEFAULT_UPDATE_MEMORY_PROMPT` design), validate returned IDs, apply in
   one transaction with full audit; LLM-decided deletes above a batch threshold
   pause as an approval gate.
-- **SSE token streaming** on `POST /threads` (async-generator Response +
-  `server.timeout(req, 0)`), WebSocket topic fanout of lifecycle events.
+- **WebSocket topic fanout** of lifecycle events, so a client can watch threads
+  it did not start. (Per-turn SSE streaming on `POST /threads` is built — §5;
+  what remains is the many-threads, many-watchers fanout.)
 - **Worker-isolated extraction**: `db.serialize()` snapshot → Worker → write
   batches back through a single-writer queue.
 - **Capsule compiler + review fan-out** (BMAD): compile self-contained task

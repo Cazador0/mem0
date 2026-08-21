@@ -78,7 +78,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/orchestration/` | Constitution loading + gate evaluation (wired: `propose_plan` gates run in `executeStep`); durable-sleep scheduler (lease + startup recovery, exactly-once wakes); per-thread promise mutex (`lock.ts`) every loop entry and extraction must hold |
 | `src/evals/harness.ts` | Prompt evals: renders fixtures through the loop's own prompt path, scores replies through its own parser |
 | `src/channels/cli-turn.ts` | CLI channel core: free text + derived status -> one action (`src/cli.ts` is I/O only) |
-| `src/server/routes.ts` | Launch/pause/resume over HTTP; resume validated against derived status |
+| `src/server/routes.ts` | Launch/pause/resume over HTTP; resume validated against derived status; `?stream=1` serves the same turn as SSE off the store's post-commit subscription |
 
 ## Do NOT
 

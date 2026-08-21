@@ -14,6 +14,9 @@ import {
   stepCount,
   type Thread,
 } from "../agent/thread";
+import type { Server } from "bun";
+/** Bun types Server as generic over its WebSocket data; this app opens none. */
+type EngramServer = Server<undefined>;
 import type { EngramDeps } from "../deps";
 
 /**
@@ -39,11 +42,11 @@ const ResumeBody = z.discriminatedUnion("type", [
 export function createServer(deps: EngramDeps) {
   return Bun.serve({
     port: deps.config.port,
-    fetch: async req => {
+    fetch: async (req, server) => {
       try {
         const denied = authorize(req, deps);
         if (denied) return denied;
-        return await route(req, deps);
+        return await route(req, deps, server);
       } catch (err) {
         const message = (err as Error).message ?? String(err);
         // Routine client mistakes are 4xx, not 500s that page someone.
@@ -85,7 +88,7 @@ function secretsEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-async function route(req: Request, deps: EngramDeps): Promise<Response> {
+async function route(req: Request, deps: EngramDeps, server?: EngramServer): Promise<Response> {
   const url = new URL(req.url);
   const parts = url.pathname.split("/").filter(Boolean);
 
@@ -99,6 +102,13 @@ async function route(req: Request, deps: EngramDeps): Promise<Response> {
     const { message, agent_id, user_id } = body.data;
     if (!deps.registry.get(agent_id)) return badRequest(`unknown agent "${agent_id}"`);
     const thread = deps.store.createThread(agent_id, { userId: user_id, agentId: agent_id });
+
+    // Same turn, two presentations. A turn can run for many LLM steps, so a
+    // client that wants to show progress asks for the stream; everyone else
+    // gets the single JSON view they always got.
+    if (wantsStream(req, url)) {
+      return streamTurn(req, deps, thread.id, () => deps.store.appendEvent(thread.id, "user_input", message), server);
+    }
     deps.store.appendEvent(thread.id, "user_input", message);
     const finished = await withThreadLock(thread.id, () => agentLoop(thread.id, deps));
     backgroundExtraction(deps, thread.id);
@@ -170,6 +180,97 @@ async function resumeThread(threadId: string, rawBody: unknown, deps: EngramDeps
   const finished = await agentLoop(threadId, deps);
   backgroundExtraction(deps, threadId);
   return Response.json(threadView(finished));
+}
+
+function wantsStream(req: Request, url: URL): boolean {
+  return url.searchParams.get("stream") === "1" || (req.headers.get("accept") ?? "").includes("text/event-stream");
+}
+
+function sse(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+/**
+ * Stream one turn as Server-Sent Events.
+ *
+ * Bun streams an async generator Response body, yielding each chunk as it is
+ * produced. Two details matter: `server.timeout(req, 0)` disables the default
+ * 10s idle timeout (a turn with several LLM calls easily exceeds it), and the
+ * generator's `finally` runs when the client disconnects, so the subscription
+ * is released even if nobody ever reads the end of the stream.
+ *
+ * Events are pushed from RecallStore's post-commit subscription, so the client
+ * only ever sees events that are durably in the log.
+ */
+function streamTurn(
+  req: Request,
+  deps: EngramDeps,
+  threadId: string,
+  seed: () => void,
+  server?: EngramServer,
+): Response {
+  server?.timeout(req, 0);
+
+  const queue: string[] = [];
+  let wake: (() => void) | null = null;
+  const push = (chunk: string) => {
+    queue.push(chunk);
+    wake?.();
+    wake = null;
+  };
+  const unsubscribe = deps.store.subscribe(threadId, event =>
+    push(sse("event", { seq: event.seq, type: event.type, data: event.data, ts: event.ts })),
+  );
+
+  let done = false;
+  let failure: string | null = null;
+  // Start the turn but do not await it here: the generator below streams what
+  // the subscription reports while it runs.
+  const turn = (async () => {
+    seed();
+    return withThreadLock(threadId, () => agentLoop(threadId, deps));
+  })()
+    .catch(err => {
+      failure = (err as Error).message;
+      return null;
+    })
+    .finally(() => {
+      done = true;
+      wake?.();
+      wake = null;
+    });
+
+  async function* body(): AsyncGenerator<string> {
+    try {
+      yield sse("thread", { thread_id: threadId });
+      while (!done || queue.length > 0) {
+        while (queue.length > 0) yield queue.shift()!;
+        if (done) break;
+        await new Promise<void>(resolve => (wake = resolve));
+      }
+      const finished = await turn;
+      if (failure) {
+        yield sse("error", { error: failure });
+        return;
+      }
+      if (finished) {
+        backgroundExtraction(deps, threadId);
+        yield sse("done", threadView(finished));
+      }
+    } finally {
+      // Client disconnect lands here too — never leave the store holding a
+      // subscription for a reader that has gone away.
+      unsubscribe();
+    }
+  }
+
+  return new Response(body() as unknown as ReadableStream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    },
+  });
 }
 
 function threadView(thread: Thread) {

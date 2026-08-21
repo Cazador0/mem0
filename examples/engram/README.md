@@ -39,7 +39,16 @@ curl -X POST :7749/threads/<id>/response \
      -d '{"type":"response","response":"yes please"}'      # resume a paused (or sleeping) thread
 curl -X POST :7749/threads/<id>/response \
      -d '{"type":"approval","approved":true}'              # approve a gated memory_delete
+
+curl -N -X POST ':7749/threads?stream=1' \
+     -d '{"message":"hello","user_id":"hunter"}'           # same turn, streamed as SSE
 ```
+
+`?stream=1` (or `Accept: text/event-stream`) returns the turn as Server-Sent
+Events instead of one JSON blob: a `thread` frame with the id, an `event` frame
+for each event as it is committed to the log, then a `done` frame carrying the
+same view the JSON route returns. Frames are published *after* the append
+commits, so a client never sees an event that could still roll back.
 
 `user_id` is required — memories are scoped per user, and a shared anonymous
 scope would silently merge every caller's memory. A `response` also wakes a
@@ -70,9 +79,9 @@ sleeping thread early; its pending scheduled wake is then consumed as stale.
 
 ## What's here vs. what's next
 
-Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, a pinned prepared-statement cache, two of the four CLAUDE.md CRITICAL rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
+Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, SSE streaming of a turn, hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, a pinned prepared-statement cache, two of the four CLAUDE.md CRITICAL rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
 
-Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out.
+Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), WebSocket topic fanout of lifecycle events, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out.
 
 Known constraints (deliberate for a local-first example): the per-thread lock is in-process, so exactly one Engram process may own a database file; entity matching is exact normalized-text (no embedding round-trip) — plural/paraphrase mentions miss where mem0's semantic matching would hit, measurable via `explain: true`.
 
