@@ -55,6 +55,7 @@ export const MIGRATIONS = [
   "003_schedule_lease.sql",
   "004_extract_failures.sql",
   "005_compactions.sql",
+  "006_artifacts.sql",
 ] as const;
 
 export function migrate(db: Database): void {

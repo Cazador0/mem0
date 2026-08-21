@@ -190,7 +190,8 @@ function nextRefFrom(thread: Thread): number {
   return max + 1;
 }
 
-function subagentSummary(child: Thread): { verdict: string; summary: string } {
+/** BMAD's bounded return: the parent gets a verdict + summary, never the log. */
+export function subagentSummary(child: Thread): { verdict: string; summary: string } {
   const last = eventAsStep(effectiveTail(child));
   if (last?.intent === "complete_task") {
     return { verdict: last.outcome, summary: truncate(last.summary, 500) };

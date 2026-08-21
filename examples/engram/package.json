@@ -12,6 +12,7 @@
     "bench:entities": "bun scripts/bench-entity-recall.ts",
     "bench:worker": "bun scripts/bench-extraction-worker.ts",
     "reconcile": "bun scripts/reconcile.ts",
+    "review": "bun scripts/review.ts",
     "verify:committed": "bash scripts/verify-committed.sh",
     "evals": "bun test test/prompt-evals.test.ts",
     "evals:record": "bun scripts/record-evals.ts"

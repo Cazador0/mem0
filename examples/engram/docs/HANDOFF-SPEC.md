@@ -25,7 +25,7 @@ merging dynamic graph-state workflows with persistent, tiered core/archival memo
 | MemGPT concept, stored the mem0 way | Core tier: named, char-budgeted, self-editable blocks rendered into every system prompt with visible budget pressure; memory edits are sync intents so the loop chains them without a human turn (heartbeat) |
 | mem0 (V3 pipeline) | ADD-only extraction (one LLM call, per-message temporal grounding against each message's own date, integer-ID indirection, rich-not-atomic 15–80-word memories, no-fabrication/no-echo rules), xxHash64 code-side dedup, insert with per-item fallback, append-only history audit table, entity side-index with crowd-penalty boost, hybrid scoring with semantic-threshold gating *before* boosting, scope keys entering payloads in exactly one function, identity-key stripping at write entries, expiration filtered at read time, procedural memory via verbatim-preserving run summarization; ADD/UPDATE/DELETE/NONE reconciliation survives **only** as an offline, audited, approval-gated compaction job *(roadmap)*. **Deliberate simplification vs mem0**: entity matching is exact normalized-text with similarity fixed at 1 (no TOPIC type, no embedding round-trip) — mem0 upserts entities at ≥0.95 similarity and matches reads at a 0.5 floor, so plural/paraphrase mentions that mem0 would catch are missed here; the recall cost is measurable via `explain: true`, and semantic entity matching is an optional upgrade when an embedder is configured |
 | spec-kit | `constitution.md` (semver + ratified/amended dates) rendered as a read-only core block — "rendered" per §8(d–e): the block holds version + digest + a pointer, never an inlined copy; structured gate results `{principle, pass, justification?}` — unjustified failure is an ERROR, and a gate naming a principle that is not in constitution.md is rejected too (the `propose_plan` intent carries them; evaluation runs in code, not in the prompt); `needs_clarification` intent with max-3 impact-ranked markers and recommended-option quick replies; deterministic code gathers facts before any LLM judgment; CLAUDE.md managed region between markers that points at live state |
-| BMAD-METHOD | Specialist agents as **data** `{id, persona, intentUnion subset}`; subagents run on fresh threads, write full output there, and return `{verdict, summary, ref}` (bounded to 500 chars); CAS state transitions (`UPDATE … WHERE <expected previous state>`); capsule compiler and asymmetric-context review fan-out *(roadmap)* |
+| BMAD-METHOD | Specialist agents as **data** `{id, persona, intentUnion subset}`; subagents run on fresh threads, write full output there, and return `{verdict, summary, ref}` (bounded to 500 chars); CAS state transitions (`UPDATE … WHERE <expected previous state>`); capsule compiler with per-section read envelopes and code-enforced write ownership, and asymmetric-context review fan-out |
 | bun | `bun:sqlite` WAL + strict + prepared statements + immediate transactions; FTS5 for both Recall and Archival keyword legs; UUIDv7 PKs (sortable = free recency); xxHash64 content fingerprints; layered CLAUDE.md with enforced invariants; hermetic test harness. Platform caveats: FTS5 is guaranteed only where Bun statically links SQLite (Linux/Windows) — on macOS it dlopens the system libsqlite3, so `openDb` probes FTS5 at startup (constitution VII) and `closeDb` checkpoints the WAL, wired to SIGINT/SIGTERM in `src/index.ts` and to SIGINT in `src/cli.ts`; `Database.setCustomSQLite(path)` is the macOS remedy. `db.query()` caches at most 20 persistent prepared statements per Database, first-come-first-served with **no eviction** (`willCache = cachedQueriesKeys.length < 20`, /home/user/bun/src/js/bun/sqlite.ts:566) — so it is not that hot statements churn, it is that whichever 20 strings are seen FIRST are cached forever and every other string re-prepares on every call. The codebase routes 53 call sites / 47 distinct SQL strings through it, so which statements win would otherwise be an accident of startup order. `src/db/statements.ts` claims the cache for a named hot set at bootstrap, importing the same string constants the call sites use so the list cannot drift |
 
 ## 3. Storage schema (single SQLite file)
@@ -59,7 +59,7 @@ Each is applied once, in order, recorded in a `migrations` table.
   summary lives here rather than in the event log (whose vocabulary is closed)
   or the archival store (which is cross-thread, where half a conversation could
   surface in an unrelated search).
-- `artifacts` — registry for capsule/artifact handoffs *(roadmap: capsule compiler)*.
+- `artifacts` + `artifact_sections` — compiled capsules: one row per capsule, one row per section carrying its owner and version.
 
 **Scope semantics** (mem0 parity): writes store the full thread identity
 (`user_id`, `agent_id`, `run_id`, absent keys normalized to `""`), and write-side
@@ -109,7 +109,7 @@ engram/
 ├── .claude/{settings.json,hooks/*.js}           # CRITICAL rules enforced as PreToolUse denials
 ├── docs/{HANDOFF-SPEC,RETRIEVAL-NOTES}.md
 ├── evals/{fixtures.ts,recorded/*.txt,README.md}  # prompt-eval corpus (recorded mode)
-├── scripts/{bench-entity-recall,bench-extraction-worker,record-evals,reconcile}.ts, verify-committed.sh
+├── scripts/{bench-entity-recall,bench-extraction-worker,record-evals,reconcile,review}.ts, verify-committed.sh
 ├── src/
 │   ├── index.ts / cli.ts / bootstrap.ts / config.ts / deps.ts
 │   ├── db/{database,statements}.ts + db/migrations/00{1..5}_*.sql
@@ -120,7 +120,7 @@ engram/
 │   ├── channels/cli-turn.ts                    # CLI channel core; src/cli.ts is I/O only
 │   ├── evals/harness.ts                        # prompt evals: render + score via the loop's own path
 │   ├── agents/registry.ts
-│   ├── orchestration/{gates,scheduler,lock}.ts # lock = per-thread promise mutex
+│   ├── orchestration/{gates,scheduler,lock,capsule}.ts # lock = per-thread promise mutex
 │   └── server/routes.ts                     # HTTP; the same turn streams as SSE on ?stream=1
 └── test/{harness,preload}.ts + *.test.ts
 ```
@@ -245,14 +245,44 @@ the event loop for essentially its whole duration in-thread (79ms at 3000
 memories) versus ~1ms through the Worker. The gain is latency fairness, not
 throughput — nothing gets faster, other work stops being blocked.
 
+### Capsule compiler + review fan-out (`orchestration/capsule.ts`)
+
+A capsule is a task brief compiled to be **self-contained**: an agent handed one
+needs nothing else. Compilation is deterministic host code — it harvests BMAD's
+Agent Records (the thread's stored distillate plus its recent turns) and the
+archival memories matching the task, so the model is asked to judge, not to
+gather. Memory content only, never ids (constitution IV), and all harvested text
+is angle-bracket escaped like every other read-side injection.
+
+It is stored as SECTIONS because both permissions are per section:
+
+- **Read** — a reviewer's envelope is the set of sections it is handed, declared
+  as data on the agent (`AgentDefinition.review.parts`). `reviewer-evidence` gets
+  `task` + `memories`, `reviewer-risk` gets `task` + `history`, `reviewer-scope`
+  gets `task` + `constitution`. That asymmetry is the feature: three reviewers on
+  one identical envelope buy one opinion three times. Reviewers never see each
+  other's sections, so a fan-out cannot converge by reading itself.
+- **Write** — one owner per section, checked in `writeSection` rather than asked
+  for in a prompt, with a compare-and-set on `version` (BMAD's CAS). Sections the
+  host compiled have no owner and are immutable to every agent.
+
+Reviewers are registry agents with two intents only — `complete_task` and
+`needs_clarification`. A reviewer that could search would pull in the context its
+envelope deliberately withheld; one that could not decline would fabricate rather
+than admit a thin envelope. Each runs on its own fresh thread, concurrently,
+under its own thread lock; the parent receives `{verdict, summary, ref}` and the
+reasoning stays in the child thread. A reviewer that crashes records `failed` and
+does not fail the fan-out.
+
+Reviewers inform, they do not decide: `scripts/review.ts` prints verdicts and
+applies nothing. Gating a change on an LLM panel would just move the approval
+away from the human it belongs to.
+
 ## 7. Roadmap (specified, not yet built)
 
 - **WebSocket topic fanout** of lifecycle events, so a client can watch threads
   it did not start. (Per-turn SSE streaming on `POST /threads` is built — §5;
   what remains is the many-threads, many-watchers fanout.)
-- **Capsule compiler + review fan-out** (BMAD): compile self-contained task
-  capsules harvesting prior Agent Records + archival memory; parallel reviewers
-  with asymmetric context envelopes; section-level write permissions enforced in code.
 - **CLAUDE.md generator** (`context/claudemd.ts`): marker-region upsert handling
   all four corruption states, manifest-hash ownership, pointer-not-copy content.
 

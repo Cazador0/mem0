@@ -13,6 +13,7 @@ bun run chat          # local REPL   (needs ANTHROPIC_API_KEY)
 bun run bench:entities # entity-recall bench; results in docs/RETRIEVAL-NOTES.md
 bun run bench:worker   # extraction-worker bench; results in the same file
 bun run reconcile --user <id> # offline consolidation pass (plans unless --apply)
+bun run review --thread <id> --task "..."  # capsule + reviewer fan-out
 bun run verify:committed # run the suite against what git actually committed
 ```
 
@@ -79,6 +80,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/agent/render.ts` | THE context seam: only place deciding what the model sees |
 | `src/agent/llm.ts` | Anthropic wrapper: schema-validated output, refusal handling, retries |
 | `src/agents/registry.ts` | Specialist agents as data (persona + intent subset) |
+| `src/orchestration/capsule.ts` | Capsule compiler + review fan-out: per-section read envelopes (asymmetric reviewers) and write ownership, both enforced in code |
 | `src/orchestration/` | Constitution loading + gate evaluation (wired: `propose_plan` gates run in `executeStep`); durable-sleep scheduler (lease + startup recovery, exactly-once wakes); per-thread promise mutex (`lock.ts`) every loop entry and extraction must hold |
 | `src/evals/harness.ts` | Prompt evals: renders fixtures through the loop's own prompt path, scores replies through its own parser |
 | `src/channels/cli-turn.ts` | CLI channel core: free text + derived status -> one action (`src/cli.ts` is I/O only) |
@@ -91,6 +93,8 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 - Let scope (`user_id`/`agent_id`/`run_id`) enter payloads anywhere except `RecallStore`/`ArchivalMemory` internals; caller metadata is stripped of identity keys.
 - Reintroduce exact three-column scope equality on an archival READ path — reads filter only on supplied keys (user-scoped sharing across agents); writes keep the full thread identity. Exact-match reads are the bug that made the curator agent blind to every user memory.
 - Make the entity index load-bearing — it is best-effort by design; its failures warn and continue.
+- Widen a reviewer's envelope to "help" it — the asymmetry IS the feature; three reviewers reading the same sections produce one opinion three times.
+- Let an agent write a capsule section it does not own, or a host-compiled one. Ownership is checked in `writeSection`, not requested in a prompt.
 - Execute a gated intent inline — record it, break, and let the resume path replay it after approval.
 - Use `require()` — ES module imports only (repo-wide rule).
 

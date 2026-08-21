@@ -23,6 +23,7 @@ bun run dev                   # HTTP API on :7749
 bun run bench:entities        # entity-recall measurement (docs/RETRIEVAL-NOTES.md)
 bun run bench:worker          # extraction-worker measurement (same file)
 bun run reconcile --user you  # offline consolidation pass; plans, applies only when asked
+bun run review --thread <id> --task "..."   # capsule + independent reviewer fan-out
 bun run evals                 # prompt evals, recorded mode (see evals/README.md)
 ```
 
@@ -80,6 +81,24 @@ wants to delete more than five memories applies **nothing** and reports
 `awaiting_approval`; a cluster is never emptied. Memories stored without a
 vector cannot be clustered and are reported, not guessed at.
 
+### Review fan-out
+
+A capsule is a task brief compiled to be self-contained — the thread's own
+history, the archival memories that match the task, and the constitution's
+principle titles — so a reviewer needs nothing else:
+
+```sh
+bun run review --thread <thread_id> --task "delete the six duplicate flight memories"
+```
+
+Each reviewer gets a **different slice** of that capsule (evidence sees the
+memories, risk sees the history, scope sees the constitution) and cannot see the
+others' findings, so three reviewers are three opinions rather than one opinion
+three times. Each writes only its own section — enforced in code, with a
+compare-and-set on the section version — and returns one bounded verdict while
+its full reasoning stays in its own thread. Reviewers inform; they never apply
+anything.
+
 ## Configuration
 
 | Env var | Default | Meaning |
@@ -101,9 +120,9 @@ vector cannot be clustered and are reported, not guessed at.
 
 ## What's here vs. what's next
 
-Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, SSE streaming of a turn, the offline reconciliation job (cosine clustering, audited UPDATE/DELETE, volume-gated deletes), opt-in Worker-isolated extraction reads, hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, a pinned prepared-statement cache, two of the four CLAUDE.md CRITICAL rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
+Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, SSE streaming of a turn, the offline reconciliation job (cosine clustering, audited UPDATE/DELETE, volume-gated deletes), opt-in Worker-isolated extraction reads, the capsule compiler with asymmetric reviewer envelopes and code-enforced section ownership, hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, a pinned prepared-statement cache, two of the four CLAUDE.md CRITICAL rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
 
-Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): WebSocket topic fanout of lifecycle events, BMAD-style capsule compiler + asymmetric review fan-out.
+Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): WebSocket topic fanout of lifecycle events, and the CLAUDE.md marker-region generator.
 
 Known constraints (deliberate for a local-first example): the per-thread lock is in-process, so exactly one Engram process may own a database file; entity matching is exact normalized-text (no embedding round-trip) — plural/paraphrase mentions miss where mem0's semantic matching would hit, measurable via `explain: true`.
 
