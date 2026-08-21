@@ -114,4 +114,5 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 Managed pointers (do not inline-copy this state elsewhere):
 - Constitution: `constitution.md` (semver'd; non-negotiable — adjust work, never dilute principles).
 - Architecture hand-off spec: `docs/HANDOFF-SPEC.md` (the source design this scaffold implements).
+- Session hand-off prompt: `docs/HANDOFF-PROMPT.md` (repo state, the traps, and the method — paste into a fresh session).
 <!-- ENGRAM:END -->
