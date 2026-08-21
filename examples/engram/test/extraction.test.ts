@@ -132,6 +132,38 @@ describe("archival extraction pipeline (mem0 V3, ADD-only)", () => {
     expect(captured).toMatch(/\[\d{4}-\d{2}-\d{2}\] user: So when do we ship\?/);
   });
 
+  test("already-extracted turns are handed to the prompt as Recent Context, not re-extracted", async () => {
+    // The watermark decides what is NEW; recentContext is what the model gets
+    // for pronoun resolution only. Nothing pinned that split before.
+    const { deps, llm } = testWorld({
+      script: [
+        { memories: [{ text: "User's dog is named Rex.", linked_refs: [] }] },
+        { memories: [{ text: "Rex is a border collie.", linked_refs: [] }] },
+      ],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "My dog is named Rex.");
+    await extractFromThread(deps, thread.id); // first turn moves the watermark
+
+    deps.store.appendEvent(thread.id, "user_input", "He is a border collie.");
+    let captured = "";
+    const original = llm.structured.bind(llm);
+    llm.structured = async function <T>(req: StructuredRequest<T>): Promise<T> {
+      captured = req.user;
+      return original(req);
+    };
+    await extractFromThread(deps, thread.id);
+
+    const recent = captured.slice(captured.indexOf("## Recent Context"), captured.indexOf("## Existing Memories"));
+    const fresh = captured.slice(captured.indexOf("## New Messages"));
+    // The already-extracted turn appears ONLY as context...
+    expect(recent).toContain("My dog is named Rex.");
+    expect(fresh).not.toContain("My dog is named Rex.");
+    // ...and the new turn appears ONLY as an extraction input.
+    expect(fresh).toContain("He is a border collie.");
+    expect(recent).not.toContain("He is a border collie.");
+  });
+
   test("each message is dated from ITS OWN event, not from extraction day", async () => {
     // The whole point of per-message dates is multi-day batches (a slept
     // thread, a backlog). Stamping every message with the extraction day would

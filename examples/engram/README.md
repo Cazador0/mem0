@@ -24,7 +24,11 @@ bun run bench:entities        # entity-recall measurement (docs/RETRIEVAL-NOTES.
 bun run evals                 # prompt evals, recorded mode (see evals/README.md)
 ```
 
-Try in chat: *"My dog is named Poppy and we walk every morning"* → the agent updates its `human` core block and archives the fact; in a later thread, prefetch injects it back into context.
+Try in chat: *"My dog is named Poppy and we walk every morning"*. The intended
+path is that the agent updates its `human` core block and archives the fact, and
+that a later thread has it re-injected by prefetch. The *mechanisms* are tested
+(prefetch injection, core edits, extraction); whether the live model chooses
+them for this sentence is not — see `evals/README.md`.
 
 ### HTTP API
 
@@ -66,7 +70,7 @@ sleeping thread early; its pending scheduled wake is then consumed as stale.
 
 ## What's here vs. what's next
 
-Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, CLAUDE.md rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
+Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, two of the four CLAUDE.md CRITICAL rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
 
 Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), trimming the hot path to bun:sqlite's 20-statement `db.query()` cache, SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out.
 

@@ -68,7 +68,21 @@ export class HttpEmbeddingProvider implements EmbeddingProvider {
     if (!res.ok) throw new Error(`embeddings endpoint ${res.status}: ${await res.text()}`);
     const body = (await res.json()) as { data: Array<{ index: number; embedding: number[] }> };
     const out: Float32Array[] = new Array(input.length);
-    for (const item of body.data) out[item.index] = Float32Array.from(item.embedding);
+    for (const item of body.data) {
+      // Validate dims HERE, at the boundary. A model whose vectors do not match
+      // the configured size otherwise stores silently and only surfaces later as
+      // cosine 0 against every existing memory — retrieval that looks empty
+      // rather than broken (constitution VII: fail loudly, not quietly).
+      if (item.embedding.length !== this.dims) {
+        throw new Error(
+          `embeddings endpoint returned ${item.embedding.length}-dim vectors but ` +
+            `ENGRAM_EMBEDDINGS_DIMS is ${this.dims}. Set _DIMS to match the model ` +
+            `(${this.model}), or point _MODEL at one that emits ${this.dims} dims. ` +
+            `Storing the mismatch would make every later search silently miss.`,
+        );
+      }
+      out[item.index] = Float32Array.from(item.embedding);
+    }
     return out;
   }
 }

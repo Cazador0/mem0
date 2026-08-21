@@ -15,7 +15,7 @@ bun run verify:committed # run the suite against what git actually committed
 ```
 
 - **CRITICAL: a green `bun test` proves nothing about what you shipped.** The repo-root `.gitignore` has a bare `db` pattern that once silently excluded this app's entire `src/db/` layer from every commit while local runs stayed green. Before pushing, run `bun run verify:committed` — it extracts `HEAD` and runs the suite there.
-- These CRITICAL rules are not prose-only: `.claude/hooks/` denies the violating tool call and re-states the correct command (bun's pattern, deriving the app root rather than hardcoding a cwd). `test/hooks.test.ts` pins both directions — the violation refused, the legitimate neighbours allowed.
+- **Two of the four CRITICAL rules below have machine checks**, not just prose: `.claude/hooks/` denies a test run pointed at a real database (rule 2's `.sqlite` clause) and a raw write to `events`/`memories` (rule 3), re-stating the correct command in the denial (bun's pattern, deriving the app root rather than hardcoding a cwd). `test/hooks.test.ts` pins both directions — the violation refused, the legitimate neighbours allowed. **Not enforced, still on you**: `verify:committed` (rule 1), instantiating `AnthropicLLM` in a test (rule 2's other clause — a hook sees the shell command, not the file you are about to write), and `setTimeout` waits (rule 4).
 - **CRITICAL: tests must stay offline and hermetic.** Every test builds its world through `test/harness.ts` (`testWorld()` = in-memory DB + `ScriptedLLM` + `FakeEmbedder`). Never instantiate `AnthropicLLM` in a test, never point a test at a real `.sqlite` file.
   - *Exception*: WAL sidecar behavior is invisible in `:memory:`, so the `closeDb` checkpoint test may create a throwaway DB under `mkdtempSync(tmpdir())` and must `rmSync` it in a `finally`. Never a path a human would recognize as theirs.
 - **CRITICAL: never write to the `events` or `memories` tables directly.** Events go through `RecallStore.appendEvent` (seq allocation + FTS projection + immediate transaction); archival mutations go through `ArchivalMemory` (hash dedup + history audit + entity relink). A raw `INSERT`/`UPDATE`/`DELETE` bypasses the audit trail and corrupts derived state.
@@ -41,6 +41,17 @@ test("my scenario", async () => {
   expect(finished.events.map(e => e.type)).toEqual(["user_input", "tool_call"]); // content before status
 });
 ```
+
+Format, at a glance:
+
+| | |
+|---|---|
+| ✅ `expect(finished.events.filter(e => e.type === "error")).toEqual([])` | assert no swallowed errors in a loop-driven test |
+| ❌ `expect(finished.events.length).toBe(2)` alone | passes while the LLM silently failed |
+| ✅ `await tickScheduler(deps, runLoop, new Date(Date.now() + 90 * 60_000))` | drive the clock explicitly |
+| ❌ `await new Promise(r => setTimeout(r, 100))` | flaky, and tests time passing rather than the condition |
+| ✅ `using dir = tempDir(...)` / `mkdtempSync(tmpdir())` + `rmSync` in a `finally` | throwaway paths |
+| ❌ `ENGRAM_DB=./engram.sqlite bun test` | points the suite at a real database (the hook refuses this) |
 
 The `ScriptedLLM` validates every scripted item against the schema the caller requested. A `{ __throw: "msg" }` item makes the next call throw an `LLMError`. **Caveat**: inside `agentLoop`, LLM failures become `error` events by design — so a drifted fixture in a loop-driven test surfaces as a swallowed error event, not a test failure. Loop-driven happy-path tests must therefore also assert `finished.events.filter(e => e.type === "error")` is empty and (where fixture order matters) that `llm.calls` consumed what the comment claims.
 

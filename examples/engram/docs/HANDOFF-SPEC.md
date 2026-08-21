@@ -25,20 +25,25 @@ merging dynamic graph-state workflows with persistent, tiered core/archival memo
 | MemGPT concept, stored the mem0 way | Core tier: named, char-budgeted, self-editable blocks rendered into every system prompt with visible budget pressure; memory edits are sync intents so the loop chains them without a human turn (heartbeat) |
 | mem0 (V3 pipeline) | ADD-only extraction (one LLM call, per-message temporal grounding against each message's own date, integer-ID indirection, rich-not-atomic 15–80-word memories, no-fabrication/no-echo rules), xxHash64 code-side dedup, insert with per-item fallback, append-only history audit table, entity side-index with crowd-penalty boost, hybrid scoring with semantic-threshold gating *before* boosting, scope keys entering payloads in exactly one function, identity-key stripping at write entries, expiration filtered at read time, procedural memory via verbatim-preserving run summarization; ADD/UPDATE/DELETE/NONE reconciliation survives **only** as an offline, audited, approval-gated compaction job *(roadmap)*. **Deliberate simplification vs mem0**: entity matching is exact normalized-text with similarity fixed at 1 (no TOPIC type, no embedding round-trip) — mem0 upserts entities at ≥0.95 similarity and matches reads at a 0.5 floor, so plural/paraphrase mentions that mem0 would catch are missed here; the recall cost is measurable via `explain: true`, and semantic entity matching is an optional upgrade when an embedder is configured |
 | spec-kit | `constitution.md` (semver + ratified/amended dates) rendered as a read-only core block — "rendered" per §8(d–e): the block holds version + digest + a pointer, never an inlined copy; structured gate results `{principle, pass, justification?}` — unjustified failure is an ERROR, and a gate naming a principle that is not in constitution.md is rejected too (the `propose_plan` intent carries them; evaluation runs in code, not in the prompt); `needs_clarification` intent with max-3 impact-ranked markers and recommended-option quick replies; deterministic code gathers facts before any LLM judgment; CLAUDE.md managed region between markers that points at live state |
-| BMAD-METHOD | Specialist agents as **data** `{id, persona, intentUnion subset}`; subagents run on fresh threads, write full output there, and return `{verdict, topFindings, ref}`; CAS state transitions (`UPDATE … WHERE <expected previous state>`); capsule compiler and asymmetric-context review fan-out *(roadmap)* |
-| bun | `bun:sqlite` WAL + strict + prepared statements + immediate transactions; FTS5 for both Recall and Archival keyword legs; UUIDv7 PKs (sortable = free recency); xxHash64 content fingerprints; layered CLAUDE.md with enforced invariants; hermetic test harness. Platform caveats: FTS5 is guaranteed only where Bun statically links SQLite (Linux/Windows) — on macOS it dlopens the system libsqlite3, so `openDb` probes FTS5 at startup (constitution VII) and `closeDb` checkpoints the WAL, wired to SIGINT/SIGTERM in `src/index.ts` and to SIGINT in `src/cli.ts`; `Database.setCustomSQLite(path)` is the macOS remedy. `db.query()` caches at most 20 persistent prepared statements per Database — the codebase currently routes ~38 distinct SQL strings through it, so hot statements churn through re-prepare *(trimming to a fixed hot set is roadmap)* |
+| BMAD-METHOD | Specialist agents as **data** `{id, persona, intentUnion subset}`; subagents run on fresh threads, write full output there, and return `{verdict, summary, ref}` (bounded to 500 chars); CAS state transitions (`UPDATE … WHERE <expected previous state>`); capsule compiler and asymmetric-context review fan-out *(roadmap)* |
+| bun | `bun:sqlite` WAL + strict + prepared statements + immediate transactions; FTS5 for both Recall and Archival keyword legs; UUIDv7 PKs (sortable = free recency); xxHash64 content fingerprints; layered CLAUDE.md with enforced invariants; hermetic test harness. Platform caveats: FTS5 is guaranteed only where Bun statically links SQLite (Linux/Windows) — on macOS it dlopens the system libsqlite3, so `openDb` probes FTS5 at startup (constitution VII) and `closeDb` checkpoints the WAL, wired to SIGINT/SIGTERM in `src/index.ts` and to SIGINT in `src/cli.ts`; `Database.setCustomSQLite(path)` is the macOS remedy. `db.query()` caches at most 20 persistent prepared statements per Database, first-come-first-served with **no eviction** (`willCache = cachedQueriesKeys.length < 20`, /home/user/bun/src/js/bun/sqlite.ts:566) — so it is not that hot statements churn, it is that whichever 20 strings are seen FIRST are cached forever and every other string re-prepares on every call. The codebase routes 53 call sites / 47 distinct SQL strings through it, so which statements win is currently an accident of startup order *(pinning the hot set is roadmap)* |
 
 ## 3. Storage schema (single SQLite file)
 
-See `src/db/migrations/` (`001_init.sql`, plus `002_schedule_sleep_seq.sql` —
-schedules rows carry the creating `sleep_until` event's seq so a superseded
-sleep's wake is consumed as stale instead of waking the newer sleep early):
+See `src/db/migrations/`: `001_init.sql`, `002_schedule_sleep_seq.sql`,
+`003_schedule_lease.sql`, `004_extract_failures.sql`, `005_compactions.sql`.
+Each is applied once, in order, recorded in a `migrations` table.
 
 - `threads` — id (uuidv7), agent_id, scope_key, user/run ids, `status_hint` (display cache only — status is always derived), `extracted_seq` extraction watermark, `extract_failures` (004) bounding how long the watermark is held for retry.
 - `events` — the Recall tier and reducer state; `UNIQUE(thread_id, seq)`; closed type enum `user_input | system_note | tool_call | tool_response | human_response | error | memory_write`; `events_fts` (FTS5) over a text projection.
 - `core_blocks` — per-agent labeled blocks with `char_limit`, `read_only`, CAS `version`.
 - `memories` — Archival tier: content, xxHash64 `hash` (UNIQUE per scope), embedding BLOB (nullable), scope columns, `memory_type` (fact|decision|procedural), provenance (`source_thread_id`, `source_event_seqs`), `expiration_date`, metadata JSON; `memories_fts` for the BM25 leg.
 - `entities` — entity → `linked_memory_ids` inverted index (regex-extracted, best-effort).
+  Note `memories.metadata.links` is a SEPARATE, currently **write-only** graph:
+  extraction stores the ids of related existing memories it linked against, but
+  no retrieval path reads them back yet (only the entity index boosts). Either
+  consume it in retrieval or drop it; leaving it written-and-unread is the kind
+  of half-feature that reads as working.
 - `memory_history` — append-only audit of every ADD/UPDATE/DELETE with before/after values; deletes soft in history.
 - `schedules` — durable sleep rows; `sleep_seq` links each row to its creating
   event (002), and `claimed_at` (003) makes the claim a **lease**. Delivery is
@@ -88,27 +93,40 @@ Per-agent capability = presence in that agent's union subset. Routing classes:
 | `done_for_now` | break | `{message}` |
 | `complete_task` | terminal | `{outcome: success\|partial\|blocked, summary}` → procedural summarization |
 
+**Proposed in the research synthesis and deliberately NOT adopted**:
+`constitution_amend` (an approval-gated amendment that bumps the constitution's
+semver) — amending the rules from inside the loop the rules govern is a
+capability this app should not hand an agent; edit `constitution.md` in a commit
+where a human reviews the diff. `handoff` (a CAS pipeline-phase transition) —
+Engram has no multi-phase pipeline to hand off between; `spawn_subagent` covers
+delegation, and a phase machine would be machinery without a user.
+
 ## 5. Module breakdown
 
 ```
 engram/
 ├── CLAUDE.md, AGENTS.md (byte-identical), constitution.md, README.md
-├── docs/HANDOFF-SPEC.md
+├── .claude/{settings.json,hooks/*.js}           # CRITICAL rules enforced as PreToolUse denials
+├── docs/{HANDOFF-SPEC,RETRIEVAL-NOTES}.md
+├── evals/{fixtures.ts,recorded/*.txt,README.md}  # prompt-eval corpus (recorded mode)
+├── scripts/{bench-entity-recall,record-evals}.ts, verify-committed.sh
 ├── src/
 │   ├── index.ts / cli.ts / bootstrap.ts / config.ts / deps.ts
-│   ├── db/database.ts + db/migrations/{001_init,002_schedule_sleep_seq}.sql
+│   ├── db/database.ts + db/migrations/00{1..5}_*.sql
 │   ├── memory/{core,recall,archival,scoring,entities,embeddings,extraction,prefetch,procedural,compaction}.ts
-│   ├── prompts/{extraction,nextstep}.ts        # every LLM-facing template in one place
-│   ├── agent/{thread,intents,loop,execute,render,llm,approval}.ts
+│   ├── prompts/{extraction,nextstep}.ts        # the two multi-paragraph system prompts
+│   ├── agent/{thread,intents,loop,execute,render,llm,approval,escape}.ts
 │   ├── channels/cli-turn.ts                    # CLI channel core; src/cli.ts is I/O only
 │   ├── evals/harness.ts                        # prompt evals: render + score via the loop's own path
 │   ├── agents/registry.ts
 │   ├── orchestration/{gates,scheduler,lock}.ts # lock = per-thread promise mutex
 │   └── server/routes.ts
-├── .claude/{settings.json,hooks/*.js}           # CRITICAL rules enforced as PreToolUse denials
-├── evals/{fixtures.ts,recorded/*.txt,README.md}  # prompt-eval corpus (recorded mode)
 └── test/{harness,preload}.ts + *.test.ts
 ```
+
+Note that `prompts/` holds the two long system prompts, not literally every
+model-facing string: `agent/intents.ts` INTENT_DOCS is rendered verbatim into
+the system prompt, and `agent/llm.ts` composes the parse-retry feedback.
 
 `orchestration/lock.ts` is load-bearing: **every** loop entry (HTTP create and
 resume, scheduler wakes, the CLI) runs under `withThreadLock(threadId, …)`, and
