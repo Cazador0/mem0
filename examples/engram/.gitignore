@@ -1,0 +1,5 @@
+# The repo-root .gitignore has a bare `db` pattern (for runtime database
+# artifacts) that also matches this app's SOURCE directory src/db/, silently
+# dropping the entire storage layer from commits. Re-include it explicitly.
+!src/db/
+!src/db/**

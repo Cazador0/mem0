@@ -1,0 +1,599 @@
+import type { Database } from "bun:sqlite";
+import { nowIso } from "../db/database";
+import { blobToVec, vecToBlob, type EmbeddingProvider } from "./embeddings";
+import { EntityIndex } from "./entities";
+import {
+  cosineSimilarity,
+  ftsMatchExpr,
+  getBm25Params,
+  normalizeBm25,
+  scoreAndRank,
+  type ScoredCandidate,
+} from "./scoring";
+import { stripIdentityKeys, type Scope } from "./recall";
+
+/**
+ * Archival tier: vector-searchable long-term memory following mem0's design —
+ * payload-as-document rows, xxHash64 content dedup, append-only history audit
+ * (constitution II), entity side-index maintenance, expiration filtered at
+ * read time, hybrid scoring with semantic-threshold gating.
+ *
+ * All writes go through this facade — never touch the memories table directly.
+ */
+
+export type MemoryType = "fact" | "decision" | "procedural";
+
+export interface MemoryRecord {
+  id: string;
+  content: string;
+  hash: string;
+  userId: string;
+  agentId: string;
+  runId: string;
+  memoryType: MemoryType;
+  sourceThreadId: string | null;
+  sourceEventSeqs: number[] | null;
+  createdAt: string;
+  updatedAt: string;
+  expirationDate: string | null;
+  metadata: Record<string, string>;
+}
+
+export interface InsertArgs {
+  content: string;
+  scope: Scope;
+  memoryType?: MemoryType;
+  metadata?: Record<string, string>;
+  sourceThreadId?: string;
+  sourceEventSeqs?: number[];
+  expirationDate?: string;
+}
+
+export interface SearchArgs {
+  query: string;
+  scope: Scope;
+  topK?: number;
+  memoryType?: MemoryType;
+  explain?: boolean;
+  showExpired?: boolean;
+}
+
+export type ScoredMemory = ScoredCandidate<MemoryRecord>;
+
+export interface HistoryRow {
+  id: number;
+  memoryId: string;
+  previousValue: string | null;
+  newValue: string | null;
+  action: "ADD" | "UPDATE" | "DELETE";
+  createdAt: string;
+  isDeleted: boolean;
+  actorId: string | null;
+}
+
+/**
+ * Vector-leg candidate ceiling. Keyword and entity hits are always included on
+ * top of this, so the bound costs semantic-only recall on old memories, never
+ * keyword recall (mem0 bounds its own entity search at top_k = 500).
+ */
+export const CANDIDATE_LIMIT = 500;
+
+/**
+ * Semantic gate, applied BEFORE any boosting (mem0's ordering discipline —
+ * boosts must never resurrect a gated-out candidate).
+ *
+ * The VALUE, unlike the scoring constants, is NOT upstream's: mem0 defaults to
+ * 0.1 (mem0/memory/main.py:1385, 1628). 0.3 is 3x stricter — higher precision,
+ * lower recall — chosen so a single shared token cannot drag an unrelated
+ * memory into context. Override with ENGRAM_SEMANTIC_THRESHOLD to match
+ * upstream; measure with `explain: true` before changing it permanently.
+ */
+const SEMANTIC_THRESHOLD = Number(process.env.ENGRAM_SEMANTIC_THRESHOLD ?? 0.3);
+/** In degraded (no-embedder) mode the BM25 leg is the base signal; gate lightly. */
+const DEGRADED_THRESHOLD = 0.01;
+
+/** Hot path: every search, and the dedup probe on every insert. */
+export const ARCHIVAL_SQL = {
+  byHashInScope:
+    "SELECT * FROM memories WHERE hash = ? AND user_id = ? AND agent_id = ? AND run_id = ?",
+  byId: "SELECT * FROM memories WHERE id = ?",
+} as const;
+
+export class ArchivalMemory {
+  private readonly entities: EntityIndex;
+
+  constructor(
+    private readonly db: Database,
+    private readonly embedder: EmbeddingProvider | null,
+  ) {
+    this.entities = new EntityIndex(db);
+  }
+
+  contentHash(content: string): string {
+    return Bun.hash.xxHash64(normalize(content)).toString(16);
+  }
+
+  /** Insert one memory. Dedupes by content hash within scope; audits the ADD. */
+  async insert(args: InsertArgs): Promise<{ id: string; created: boolean; memory: MemoryRecord }> {
+    const hash = this.contentHash(args.content);
+    const scope = normalizeScope(args.scope);
+    const existing = this.db
+      .query(ARCHIVAL_SQL.byHashInScope)
+      .get(hash, scope.userId, scope.agentId, scope.runId) as RawRow | null;
+    if (existing) {
+      return { id: existing.id, created: false, memory: rowToRecord(existing) };
+    }
+
+    const id = Bun.randomUUIDv7();
+    const now = nowIso();
+    const metadata = stripIdentityKeys(args.metadata ?? {});
+    let embedding: Float32Array | null = null;
+    if (this.embedder) {
+      try {
+        embedding = await this.embedder.embed(args.content);
+      } catch (err) {
+        console.warn(`[engram] embedding failed, storing without vector: ${(err as Error).message}`);
+      }
+    }
+
+    const write = this.db.transaction(() => {
+      this.db
+        .query(
+          `INSERT INTO memories
+             (id, content, hash, embedding, user_id, agent_id, run_id, memory_type,
+              source_thread_id, source_event_seqs, created_at, updated_at, expiration_date, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          args.content,
+          hash,
+          embedding ? vecToBlob(embedding) : null,
+          scope.userId,
+          scope.agentId,
+          scope.runId,
+          args.memoryType ?? "fact",
+          args.sourceThreadId ?? null,
+          args.sourceEventSeqs ? JSON.stringify(args.sourceEventSeqs) : null,
+          now,
+          now,
+          args.expirationDate ?? null,
+          JSON.stringify(metadata),
+        );
+      this.db
+        .query("INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)")
+        .run(args.content, id);
+      this.addHistory(id, null, args.content, "ADD", false);
+    });
+    try {
+      write.immediate();
+    } catch (err) {
+      // The dedup SELECT above ran before the embed await; a concurrent insert
+      // of the same content can win that race. Honor the created:false
+      // contract instead of surfacing the UNIQUE violation.
+      if (String((err as Error).message).includes("UNIQUE")) {
+        const winner = this.db
+          .query(ARCHIVAL_SQL.byHashInScope)
+          .get(hash, scope.userId, scope.agentId, scope.runId) as RawRow | null;
+        if (winner) return { id: winner.id, created: false, memory: rowToRecord(winner) };
+      }
+      throw err;
+    }
+
+    // Best-effort side index — never fails the write (constitution VII).
+    this.entities.linkMemory(id, args.content, scope);
+
+    const memory = this.getById(id);
+    if (!memory) throw new Error("memory row vanished after insert");
+    return { id, created: true, memory };
+  }
+
+  getById(id: string): MemoryRecord | null {
+    const row = this.db.query(ARCHIVAL_SQL.byId).get(id) as RawRow | null;
+    return row ? rowToRecord(row) : null;
+  }
+
+  /**
+   * Rows in scope, newest first, each with its decoded vector (or null when the
+   * row was stored during an embedding outage or with no embedder configured).
+   *
+   * This is the enumeration the offline reconciliation job walks: unlike
+   * `search()` there is no query, no scoring, no boost and no candidate
+   * ceiling beyond `limit` — the caller decides relatedness, so it needs the
+   * vectors rather than a ranking. Expired rows are filtered like every other
+   * read path.
+   */
+  listWithVectors(
+    scope: Scope,
+    opts: { limit?: number; showExpired?: boolean } = {},
+  ): Array<{ memory: MemoryRecord; vector: Float32Array | null }> {
+    const { where, params } = scopeFilter(scope);
+    const rows = this.db
+      .query(`SELECT * FROM memories WHERE ${where} ORDER BY created_at DESC LIMIT ?`)
+      .all(...params, opts.limit ?? CANDIDATE_LIMIT) as RawRow[];
+    return rows
+      .filter(row => opts.showExpired || !isExpired(row))
+      .map(row => ({
+        memory: rowToRecord(row),
+        vector: row.embedding ? blobToVec(row.embedding) : null,
+      }));
+  }
+
+  /**
+   * Hybrid search: cosine (when an embedder exists) + sigmoid-BM25 + entity boost.
+   *
+   * Read-side scope follows mem0's semantics: filter only on the identity keys
+   * the caller SUPPLIES (undefined = any; a supplied value — including "" — must
+   * match exactly, so anonymous scopes never wildcard). This is what lets a
+   * curator thread, whose own identity is agent_id "curator", see the user's
+   * memories written from engram threads. Write-side dedup stays exact on all
+   * three columns — storage scope is the writer's identity.
+   */
+  async search(args: SearchArgs): Promise<ScoredMemory[]> {
+    const topK = args.topK ?? 5;
+    const memoryType = args.memoryType ?? "";
+    const { where, params } = scopeFilter(args.scope);
+
+    // Keyword and entity legs run first: each does its own scoped, bounded SQL,
+    // and their hits are candidates no matter how old they are.
+    const bm25All = this.bm25Scores(args.query, args.scope);
+    const entityAll = this.entities.boostsForQuery(args.query, args.scope);
+    const keywordIds = new Set([...Object.keys(bm25All), ...Object.keys(entityAll)]);
+
+    // Candidate set = those hits UNION the most recent CANDIDATE_LIMIT rows.
+    // Reads are user-scoped, so the unbounded version materialized (and cosined)
+    // every memory the user has ever stored on every loop iteration via
+    // prefetch. Tradeoff: a memory that is neither a keyword/entity hit nor
+    // recent enough can no longer be recovered by semantic similarity alone.
+    const byId = new Map<string, RawRow>();
+    for (const row of this.db
+      .query(
+        `SELECT * FROM memories
+         WHERE ${where} AND (? = '' OR memory_type = ?)
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(...params, memoryType, memoryType, CANDIDATE_LIMIT) as RawRow[]) {
+      byId.set(row.id, row);
+    }
+    const missing = [...keywordIds].filter(id => !byId.has(id));
+    if (missing.length > 0) {
+      // Re-applies scope and type, so a keyword hit can never widen the scope.
+      for (const row of this.db
+        .query(
+          `SELECT * FROM memories
+           WHERE id IN (${missing.map(() => "?").join(",")})
+             AND ${where} AND (? = '' OR memory_type = ?)`,
+        )
+        .all(...missing, ...params, memoryType, memoryType) as RawRow[]) {
+        byId.set(row.id, row);
+      }
+    }
+
+    const rows = [...byId.values()].filter(row => args.showExpired || !isExpired(row));
+    if (rows.length === 0) return [];
+
+    const inScope = new Set(rows.map(r => r.id));
+    const bm25Raw = filterKeys(bm25All, inScope);
+    const entityBoosts = filterKeys(entityAll, inScope);
+    const explain = args.explain ?? false;
+
+    if (!this.embedder) {
+      return this.degradedResults(rows, bm25Raw, entityBoosts, topK, explain);
+    }
+
+    const queryVec = await this.embedQuery(args.query);
+    if (!queryVec) {
+      return this.degradedResults(rows, bm25Raw, entityBoosts, topK, explain);
+    }
+    const withVec = rows.filter(r => r.embedding !== null);
+    const withoutVec = rows.filter(r => r.embedding === null);
+    warnOnDimsMismatch(queryVec, withVec);
+
+    const semantic = withVec.map(r => ({
+      id: r.id,
+      score: cosineSimilarity(queryVec, blobToVec(r.embedding as Uint8Array)),
+      payload: rowToRecord(r),
+    }));
+    const primary = scoreAndRank(semantic, bm25Raw, entityBoosts, SEMANTIC_THRESHOLD, topK, explain);
+
+    // Rows stored without a vector (embedding outage, pre-embedder era) must
+    // stay reachable: score them degraded-style on the BM25 leg and merge.
+    const fallback = scoreAndRank(
+      withoutVec
+        .filter(r => (bm25Raw[r.id] ?? 0) > 0)
+        .map(r => ({ id: r.id, score: bm25Raw[r.id]!, payload: rowToRecord(r) })),
+      {},
+      entityBoosts,
+      DEGRADED_THRESHOLD,
+      topK,
+      explain,
+    );
+
+    return [...primary, ...fallback].sort((a, b) => b.score - a.score).slice(0, topK);
+  }
+
+  /**
+   * The query vector `search()` scores against, or null when there is no
+   * embedder or the endpoint is down (a transient outage must degrade like
+   * every other embed call site — never abort the search).
+   *
+   * Public because the extraction reader Worker must not hold credentials: the
+   * main thread embeds, the Worker scores against the vector it is handed.
+   */
+  async embedQuery(text: string): Promise<Float32Array | null> {
+    if (!this.embedder) return null;
+    try {
+      return await this.embedder.embed(text);
+    } catch (err) {
+      console.warn(`[engram] query embedding failed, degrading to keyword search: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /** No usable query vector: the normalized BM25 leg becomes the base signal. */
+  private degradedResults(
+    rows: RawRow[],
+    bm25Raw: Record<string, number>,
+    entityBoosts: Record<string, number>,
+    topK: number,
+    explain: boolean,
+  ): ScoredMemory[] {
+    const byId = new Map(rows.map(r => [r.id, r]));
+    const semantic = Object.entries(bm25Raw).map(([id, score]) => ({
+      id,
+      score,
+      payload: rowToRecord(byId.get(id)!),
+    }));
+    return scoreAndRank(semantic, {}, entityBoosts, DEGRADED_THRESHOLD, topK, explain);
+  }
+
+  /** Rewrite a memory's content: audits before/after, rehashes, re-embeds, relinks entities. */
+  async update(id: string, newContent: string, actorId?: string): Promise<{ ok: boolean; message: string }> {
+    const row = this.db.query(ARCHIVAL_SQL.byId).get(id) as RawRow | null;
+    // Result strings never carry raw memory UUIDs — they flow into prompts.
+    if (!row) return { ok: false, message: "memory not found — it may have been deleted already" };
+
+    const newHash = this.contentHash(newContent);
+    const collision = this.db
+      .query("SELECT id FROM memories WHERE hash = ? AND user_id = ? AND agent_id = ? AND run_id = ? AND id != ?")
+      .get(newHash, row.user_id, row.agent_id, row.run_id, id) as { id: string } | null;
+    if (collision) {
+      return {
+        ok: false,
+        message:
+          "new content duplicates another existing memory in this scope — search for it and update that one, or delete this one instead",
+      };
+    }
+
+    let embedding: Float32Array | null = null;
+    if (this.embedder) {
+      try {
+        embedding = await this.embedder.embed(newContent);
+      } catch (err) {
+        console.warn(`[engram] re-embedding failed on update: ${(err as Error).message}`);
+      }
+    }
+    const write = this.db.transaction(() => {
+      this.addHistory(id, row.content, newContent, "UPDATE", false, actorId);
+      // On re-embed failure store NULL (matching insert()): the old content's
+      // vector would gate the NEW content out semantically while excluding the
+      // row from the NULL-embedding BM25 fallback — unfindable either way.
+      this.db
+        .query("UPDATE memories SET content = ?, hash = ?, embedding = ?, updated_at = ? WHERE id = ?")
+        .run(newContent, newHash, embedding ? vecToBlob(embedding) : null, nowIso(), id);
+      this.db.query("DELETE FROM memories_fts WHERE memory_id = ?").run(id);
+      this.db.query("INSERT INTO memories_fts (content, memory_id) VALUES (?, ?)").run(newContent, id);
+    });
+    try {
+      write.immediate();
+    } catch (err) {
+      // Same TOCTOU as insert(): the embed await sits between the collision
+      // pre-check and the write — honor the readable-result contract.
+      if (String((err as Error).message).includes("UNIQUE")) {
+        return {
+          ok: false,
+          message:
+            "new content duplicates another existing memory in this scope — search for it and update that one, or delete this one instead",
+        };
+      }
+      throw err;
+    }
+
+    const scope = { userId: row.user_id, agentId: row.agent_id, runId: row.run_id };
+    this.entities.unlinkMemory(id, scope);
+    this.entities.linkMemory(id, newContent, scope);
+    return { ok: true, message: "memory updated" };
+  }
+
+  /** Delete a memory. The history row survives with is_deleted = 1 (soft in audit). */
+  delete(id: string, actorId?: string): { ok: boolean; message: string } {
+    const row = this.db.query(ARCHIVAL_SQL.byId).get(id) as RawRow | null;
+    if (!row) return { ok: false, message: "memory not found — it may have been deleted already" };
+    const write = this.db.transaction(() => {
+      this.addHistory(id, row.content, null, "DELETE", true, actorId);
+      this.db.query("DELETE FROM memories WHERE id = ?").run(id);
+      this.db.query("DELETE FROM memories_fts WHERE memory_id = ?").run(id);
+    });
+    write.immediate();
+    this.entities.unlinkMemory(id, { userId: row.user_id, agentId: row.agent_id, runId: row.run_id });
+    return { ok: true, message: "memory deleted (audit retained)" };
+  }
+
+  history(memoryId: string): HistoryRow[] {
+    const rows = this.db
+      .query("SELECT * FROM memory_history WHERE memory_id = ? ORDER BY id ASC")
+      .all(memoryId) as Array<{
+      id: number;
+      memory_id: string;
+      previous_value: string | null;
+      new_value: string | null;
+      action: string;
+      created_at: string;
+      is_deleted: number;
+      actor_id: string | null;
+    }>;
+    return rows.map(r => ({
+      id: r.id,
+      memoryId: r.memory_id,
+      previousValue: r.previous_value,
+      newValue: r.new_value,
+      action: r.action as HistoryRow["action"],
+      createdAt: r.created_at,
+      isDeleted: r.is_deleted === 1,
+      actorId: r.actor_id,
+    }));
+  }
+
+  private bm25Scores(query: string, scope: Scope): Record<string, number> {
+    const match = ftsMatchExpr(query);
+    if (!match) return {};
+    const [midpoint, steepness] = getBm25Params(query);
+    // Scope is filtered INSIDE the SQL (supplied keys only, matching search()),
+    // and candidates are rank-ordered before the limit — a global unordered
+    // LIMIT would let other scopes starve this one out of the candidate set.
+    const { where, params } = scopeFilter(scope, "m.");
+    const rows = this.db
+      .query(
+        `SELECT f.memory_id AS memory_id, bm25(memories_fts) AS raw
+         FROM memories_fts f
+         JOIN memories m ON m.id = f.memory_id
+         WHERE memories_fts MATCH ?
+           AND ${where}
+         ORDER BY rank
+         LIMIT 200`,
+      )
+      .all(match, ...params) as Array<{
+      memory_id: string;
+      raw: number;
+    }>;
+    const out: Record<string, number> = {};
+    for (const row of rows) {
+      // FTS5 bm25() returns negative values where lower = better; flip sign.
+      out[row.memory_id] = normalizeBm25(-row.raw, midpoint, steepness);
+    }
+    return out;
+  }
+
+  private addHistory(
+    memoryId: string,
+    previous: string | null,
+    next: string | null,
+    action: HistoryRow["action"],
+    isDeleted: boolean,
+    actorId?: string,
+  ): void {
+    this.db
+      .query(
+        `INSERT INTO memory_history (memory_id, previous_value, new_value, action, created_at, is_deleted, actor_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(memoryId, previous, next, action, nowIso(), isDeleted ? 1 : 0, actorId ?? null);
+  }
+}
+
+interface RawRow {
+  id: string;
+  content: string;
+  hash: string;
+  embedding: Uint8Array | null;
+  user_id: string;
+  agent_id: string;
+  run_id: string;
+  memory_type: string;
+  source_thread_id: string | null;
+  source_event_seqs: string | null;
+  created_at: string;
+  updated_at: string;
+  expiration_date: string | null;
+  metadata: string;
+}
+
+function rowToRecord(row: RawRow): MemoryRecord {
+  return {
+    id: row.id,
+    content: row.content,
+    hash: row.hash,
+    userId: row.user_id,
+    agentId: row.agent_id,
+    runId: row.run_id,
+    memoryType: row.memory_type as MemoryType,
+    sourceThreadId: row.source_thread_id,
+    sourceEventSeqs: row.source_event_seqs ? (JSON.parse(row.source_event_seqs) as number[]) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    expirationDate: row.expiration_date,
+    metadata: JSON.parse(row.metadata) as Record<string, string>,
+  };
+}
+
+function normalize(content: string): string {
+  return content.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function normalizeScope(scope: Scope): { userId: string; agentId: string; runId: string } {
+  return { userId: scope.userId ?? "", agentId: scope.agentId ?? "", runId: scope.runId ?? "" };
+}
+
+/**
+ * Read-side WHERE fragment over the identity columns: one clause per key the
+ * caller supplied (mem0's subset semantics). undefined = no restriction;
+ * "" restricts to the anonymous value — it never wildcards.
+ */
+function scopeFilter(scope: Scope, prefix = ""): { where: string; params: string[] } {
+  const clauses: string[] = [];
+  const params: string[] = [];
+  if (scope.userId !== undefined) {
+    clauses.push(`${prefix}user_id = ?`);
+    params.push(scope.userId);
+  }
+  if (scope.agentId !== undefined) {
+    clauses.push(`${prefix}agent_id = ?`);
+    params.push(scope.agentId);
+  }
+  if (scope.runId !== undefined) {
+    clauses.push(`${prefix}run_id = ?`);
+    params.push(scope.runId);
+  }
+  if (clauses.length === 0) {
+    // Fail closed. An empty scope is always a caller bug, and emitting "1 = 1"
+    // would silently turn the narrowest possible request into a cross-user
+    // read of every memory in the database.
+    throw new Error("archival read requires at least one scope key (userId/agentId/runId)");
+  }
+  return { where: clauses.join(" AND "), params };
+}
+
+function isExpired(row: RawRow): boolean {
+  if (!row.expiration_date) return false;
+  return row.expiration_date < nowIso().slice(0, 10);
+}
+
+function filterKeys(map: Record<string, number>, allowed: Set<string>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(map)) {
+    if (allowed.has(key)) out[key] = value;
+  }
+  return out;
+}
+
+let warnedDimsMismatch = false;
+
+/**
+ * A changed embedding model/dims makes every stored vector cosine to 0, which
+ * the threshold gate then silently discards — surface it loudly, once.
+ */
+function warnOnDimsMismatch(queryVec: Float32Array, rows: RawRow[]): void {
+  if (warnedDimsMismatch) return;
+  for (const row of rows) {
+    const stored = blobToVec(row.embedding as Uint8Array);
+    if (stored.length !== queryVec.length) {
+      warnedDimsMismatch = true;
+      console.warn(
+        `[engram] embedding dims mismatch: stored vectors have ${stored.length} dims but the ` +
+          `configured embedder returns ${queryVec.length} — stored memories will score 0 semantically. ` +
+          `Re-embed the store or restore the original ENGRAM_EMBEDDINGS_MODEL/_DIMS.`,
+      );
+      return;
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "next_step": {
+    "intent": "archival_search",
+    "query": "favorite colour teal duplicates",
+    "top_k": 25
+  }
+}

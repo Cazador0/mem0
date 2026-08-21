@@ -1,0 +1,8 @@
+```json
+{
+  "next_step": {
+    "intent": "done_for_now",
+    "message": "You told me your dog Poppy walks with you every morning, and that those walks are the highlight of your day."
+  }
+}
+```

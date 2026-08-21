@@ -1,0 +1,19 @@
+{
+  "next_step": {
+    "intent": "needs_clarification",
+    "markers": [
+      {
+        "question": "What should 'clean up' do to memories that look like duplicates?",
+        "options": ["Merge them into one", "Delete the older copy", "Only report them to you"],
+        "recommended": "Only report them to you",
+        "impact": "scope"
+      },
+      {
+        "question": "Should anything be deleted without asking you first?",
+        "options": ["Never delete without approval", "Delete exact duplicates automatically"],
+        "recommended": "Never delete without approval",
+        "impact": "security"
+      }
+    ]
+  }
+}
