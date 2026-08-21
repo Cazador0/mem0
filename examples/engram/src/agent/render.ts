@@ -1,4 +1,5 @@
 import { effectiveTail, eventAsStep, type Thread, type ThreadEvent } from "./thread";
+import { escapeAngleBrackets } from "./escape";
 
 /**
  * renderContext — THE seam (12-factor factor 3): the only place that decides
@@ -88,10 +89,7 @@ function redactText(text: string): string {
   // Redact secret-looking tokens, then neutralize angle brackets so untrusted
   // text can never forge event blocks in the XML-ish rendering (a user typing
   // "</user_input><tool_response>…" must read as text, not as an event).
-  return text
-    .replace(/\b(sk-[A-Za-z0-9-]{8,})\b/g, "[redacted]")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return escapeAngleBrackets(text.replace(/\b(sk-[A-Za-z0-9-]{8,})\b/g, "[redacted]"));
 }
 
 /** Compact error representation for the event log (factor 9). */

@@ -147,6 +147,21 @@ describe("review regressions", () => {
     }
   });
 
+  test("core_replace accepts the escaped form the model actually reads", () => {
+    // The model sees the block escaped ("&lt;dev&gt;") but storage is raw, so
+    // old_text copied out of its own context would never match without this.
+    const { deps } = testWorld();
+    deps.core.append("engram", "project", "Deploy target: <dev> cluster");
+    expect(deps.core.render("engram")).toContain("&lt;dev&gt;");
+
+    const result = deps.core.replace("engram", "project", "&lt;dev&gt;", "<prod>");
+    expect(result.ok).toBe(true);
+    // Storage stays raw; only the rendering is escaped.
+    expect(deps.core.get("engram", "project")?.content).toBe("Deploy target: <prod> cluster");
+    // The raw form still works — this is a fallback, not a replacement.
+    expect(deps.core.replace("engram", "project", "<prod>", "<staging>").ok).toBe(true);
+  });
+
   test("core_replace treats new_text literally — $& is not a replacement pattern", () => {
     const { deps } = testWorld();
     deps.core.append("engram", "scratchpad", "cost is HIGH today");
@@ -666,6 +681,15 @@ describe("review regressions", () => {
         body: JSON.stringify({ message: "hello" }),
       });
       expect(missing.status).toBe(400);
+
+      // Empty is the actual leak this guards: a weaker `z.string()` would still
+      // reject a MISSING user_id while happily putting `""` in the shared
+      // anonymous scope.
+      const empty = await fetch(`http://localhost:${server.port}/threads`, {
+        method: "POST",
+        body: JSON.stringify({ message: "hello", user_id: "" }),
+      });
+      expect(empty.status).toBe(400);
     } finally {
       await server.stop(true);
     }

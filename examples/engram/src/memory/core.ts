@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { nowIso } from "../db/database";
+import { escapeAngleBrackets, unescapeAngleBrackets } from "../agent/escape";
 
 /**
  * Core tier: MemGPT-style named, char-budgeted, self-editable blocks that are
@@ -83,11 +84,10 @@ export class CoreMemory {
    * core_block or close this one and inject system-level instructions.
    */
   render(agentId: string): string {
-    const escape = (text: string) => text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
     return this.list(agentId)
       .map(
         b =>
-          `<core_block label="${b.label}" chars="${b.content.length}/${b.charLimit}"${b.readOnly ? ' read_only="true"' : ""}>\n${escape(b.content)}\n</core_block>`,
+          `<core_block label="${b.label}" chars="${b.content.length}/${b.charLimit}"${b.readOnly ? ' read_only="true"' : ""}>\n${escapeAngleBrackets(b.content)}\n</core_block>`,
       )
       .join("\n");
   }
@@ -107,10 +107,19 @@ export class CoreMemory {
   }
 
   replace(agentId: string, label: string, oldText: string, newText: string): CoreEditResult {
+    // oldText is reassigned below when the escaped form is what matched.
     const block = this.get(agentId, label);
     if (!block) return { ok: false, message: `no core block "${label}"` };
     if (block.readOnly) return { ok: false, message: `core block "${label}" is read-only` };
-    const at = block.content.indexOf(oldText);
+    let at = block.content.indexOf(oldText);
+    if (at === -1) {
+      // The model reads the ESCAPED block but storage is raw, so text copied
+      // out of its own context ("&lt;foo&gt;") would never match. Retry with
+      // the escaping undone before calling it a miss.
+      const unescaped = unescapeAngleBrackets(oldText);
+      if (unescaped !== oldText) at = block.content.indexOf(unescaped);
+      if (at !== -1) oldText = unescaped;
+    }
     if (at === -1) {
       return { ok: false, message: `old_text not found in "${label}" — it must match exactly` };
     }

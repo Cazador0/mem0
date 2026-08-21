@@ -71,7 +71,6 @@ export interface HistoryRow {
   actorId: string | null;
 }
 
-/** Semantic gate applied before any boosting (mem0's threshold discipline). */
 /**
  * Vector-leg candidate ceiling. Keyword and entity hits are always included on
  * top of this, so the bound costs semantic-only recall on old memories, never
@@ -79,7 +78,17 @@ export interface HistoryRow {
  */
 export const CANDIDATE_LIMIT = 500;
 
-const SEMANTIC_THRESHOLD = 0.3;
+/**
+ * Semantic gate, applied BEFORE any boosting (mem0's ordering discipline —
+ * boosts must never resurrect a gated-out candidate).
+ *
+ * The VALUE, unlike the scoring constants, is NOT upstream's: mem0 defaults to
+ * 0.1 (mem0/memory/main.py:1385, 1628). 0.3 is 3x stricter — higher precision,
+ * lower recall — chosen so a single shared token cannot drag an unrelated
+ * memory into context. Override with ENGRAM_SEMANTIC_THRESHOLD to match
+ * upstream; measure with `explain: true` before changing it permanently.
+ */
+const SEMANTIC_THRESHOLD = Number(process.env.ENGRAM_SEMANTIC_THRESHOLD ?? 0.3);
 /** In degraded (no-embedder) mode the BM25 leg is the base signal; gate lightly. */
 const DEGRADED_THRESHOLD = 0.01;
 

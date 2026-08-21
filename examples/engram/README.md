@@ -58,6 +58,7 @@ sleeping thread early; its pending scheduled wake is then consumed as stale.
 | `ENGRAM_EMBEDDINGS_MODEL` / `_DIMS` | `text-embedding-3-small` / `1536` | embedding config |
 | `ENGRAM_EMBEDDINGS_API_KEY` | — | bearer token for the embeddings endpoint (omit for keyless local servers) |
 | `ENGRAM_MAX_STEPS` | `20` | LLM steps per turn (12-factor factor 10) |
+| `ENGRAM_SEMANTIC_THRESHOLD` | `0.3` | semantic gate before boosting; upstream mem0 defaults to `0.1` (see `docs/RETRIEVAL-NOTES.md`) |
 | `ENGRAM_USER` | `$USER`, else `local` | memory scope for `bun run chat`; warns when neither is set (all sessions would share one scope) |
 | `ENGRAM_API_TOKEN` | — | when set, every route except `/health` requires `Authorization: Bearer <token>` |
 | `PORT` | `7749` | HTTP port |

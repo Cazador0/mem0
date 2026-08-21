@@ -132,6 +132,35 @@ describe("archival extraction pipeline (mem0 V3, ADD-only)", () => {
     expect(captured).toMatch(/\[\d{4}-\d{2}-\d{2}\] user: So when do we ship\?/);
   });
 
+  test("each message is dated from ITS OWN event, not from extraction day", async () => {
+    // The whole point of per-message dates is multi-day batches (a slept
+    // thread, a backlog). Stamping every message with the extraction day would
+    // pass a looser assertion, so pin the exact distinct dates end-to-end.
+    const { deps, llm } = testWorld({
+      script: [{ memories: [{ text: "User flew to Osaka in August 2026.", linked_refs: [] }] }],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "I flew to Osaka yesterday.");
+    deps.store.appendEvent(thread.id, "user_input", "The jet lag finally cleared today.");
+
+    // Backdate the stored events to different days (tests may read tables).
+    deps.db.query("UPDATE events SET ts = ? WHERE thread_id = ? AND seq = 0").run("2026-08-01T09:00:00.000Z", thread.id);
+    deps.db.query("UPDATE events SET ts = ? WHERE thread_id = ? AND seq = 1").run("2026-08-04T09:00:00.000Z", thread.id);
+
+    let captured = "";
+    const original = llm.structured.bind(llm);
+    llm.structured = async function <T>(req: StructuredRequest<T>): Promise<T> {
+      captured = req.user;
+      return original(req);
+    };
+    await extractFromThread(deps, thread.id);
+
+    expect(captured).toContain("[2026-08-01] user: I flew to Osaka yesterday.");
+    expect(captured).toContain("[2026-08-04] user: The jet lag finally cleared today.");
+    // Observation Date is the FIRST new message's date, not today's.
+    expect(captured).toContain("## Observation Date (date of the first new message)\n2026-08-01");
+  });
+
   test("extraction prompt grounds each new message on its own date", () => {
     const prompt = buildExtractionUser({
       recentContext: [],

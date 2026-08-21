@@ -68,6 +68,23 @@ indexing those fills the index with junk), while queries opt into
 nothing; a missed one costs the entire boost. Pinned by *"a bare entity name —
 the most natural query there is — fires the boost"* in `test/memory.test.ts`.
 
+## The semantic gate is NOT upstream's value
+
+The scoring constants are a faithful constant-for-constant port, but the
+threshold is not, and an earlier version of this file implied otherwise.
+Upstream mem0 defaults to **0.1** (`mem0/memory/main.py:1385, 1628`); Engram
+uses **0.3** — three times stricter. That buys precision (one shared token
+cannot drag an unrelated memory into context) and costs recall, and it is the
+single constant most likely to explain a "why didn't it remember that?" report.
+`ENGRAM_SEMANTIC_THRESHOLD` overrides it; compare with `explain: true` before
+changing it permanently.
+
+Two related sharpnesses in the degraded (no-embedder / embed-outage) path, both
+pre-existing: it is really *BM25 candidates, entity-reranked* — a memory with an
+entity match but no FTS token match cannot enter the candidate set at all — and
+the BM25-derived value is reported in the `semanticScore` field of `explain`
+output, which reads misleadingly.
+
 ## Residual gaps (real, unfixed, deliberate)
 
 These are the recall cost of skipping the embedding round-trip:

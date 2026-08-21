@@ -59,7 +59,17 @@ export function lastEvent(thread: Thread): ThreadEvent | undefined {
  * otherwise a background extraction would flip a paused thread to "idle" and
  * make it unresumable.
  */
-const ANNOTATION_TYPES: ReadonlySet<EventType> = new Set(["memory_write", "system_note"]);
+export const ANNOTATION_TYPES: ReadonlySet<EventType> = new Set(["memory_write", "system_note"]);
+
+/**
+ * Annotations appended by BACKGROUND work only. system_note is excluded: a
+ * scheduler wake is a turn boundary, so it legitimately resets an error run.
+ * Derived from ANNOTATION_TYPES so a new annotation type cannot be added to one
+ * notion of "annotation" and silently missed by the other.
+ */
+const BACKGROUND_ANNOTATIONS: ReadonlySet<EventType> = new Set(
+  [...ANNOTATION_TYPES].filter(t => t !== "system_note"),
+);
 
 export function effectiveTail(thread: Thread): ThreadEvent | undefined {
   for (let i = thread.events.length - 1; i >= 0; i--) {
@@ -143,7 +153,7 @@ export function consecutiveErrors(thread: Thread): number {
   let n = 0;
   for (let i = thread.events.length - 1; i >= 0; i--) {
     const type = thread.events[i]!.type;
-    if (type === "memory_write") continue;
+    if (BACKGROUND_ANNOTATIONS.has(type)) continue;
     if (type === "error") n++;
     else break;
   }
