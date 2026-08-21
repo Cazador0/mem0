@@ -194,6 +194,32 @@ export class ArchivalMemory {
   }
 
   /**
+   * Rows in scope, newest first, each with its decoded vector (or null when the
+   * row was stored during an embedding outage or with no embedder configured).
+   *
+   * This is the enumeration the offline reconciliation job walks: unlike
+   * `search()` there is no query, no scoring, no boost and no candidate
+   * ceiling beyond `limit` — the caller decides relatedness, so it needs the
+   * vectors rather than a ranking. Expired rows are filtered like every other
+   * read path.
+   */
+  listWithVectors(
+    scope: Scope,
+    opts: { limit?: number; showExpired?: boolean } = {},
+  ): Array<{ memory: MemoryRecord; vector: Float32Array | null }> {
+    const { where, params } = scopeFilter(scope);
+    const rows = this.db
+      .query(`SELECT * FROM memories WHERE ${where} ORDER BY created_at DESC LIMIT ?`)
+      .all(...params, opts.limit ?? CANDIDATE_LIMIT) as RawRow[];
+    return rows
+      .filter(row => opts.showExpired || !isExpired(row))
+      .map(row => ({
+        memory: rowToRecord(row),
+        vector: row.embedding ? blobToVec(row.embedding) : null,
+      }));
+  }
+
+  /**
    * Hybrid search: cosine (when an embedder exists) + sigmoid-BM25 + entity boost.
    *
    * Read-side scope follows mem0's semantics: filter only on the identity keys

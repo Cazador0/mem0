@@ -109,12 +109,12 @@ engram/
 ├── .claude/{settings.json,hooks/*.js}           # CRITICAL rules enforced as PreToolUse denials
 ├── docs/{HANDOFF-SPEC,RETRIEVAL-NOTES}.md
 ├── evals/{fixtures.ts,recorded/*.txt,README.md}  # prompt-eval corpus (recorded mode)
-├── scripts/{bench-entity-recall,record-evals}.ts, verify-committed.sh
+├── scripts/{bench-entity-recall,record-evals,reconcile}.ts, verify-committed.sh
 ├── src/
 │   ├── index.ts / cli.ts / bootstrap.ts / config.ts / deps.ts
 │   ├── db/{database,statements}.ts + db/migrations/00{1..5}_*.sql
-│   ├── memory/{core,recall,archival,scoring,entities,embeddings,extraction,prefetch,procedural,compaction}.ts
-│   ├── prompts/{extraction,nextstep}.ts        # the two multi-paragraph system prompts
+│   ├── memory/{core,recall,archival,scoring,entities,embeddings,extraction,prefetch,procedural,compaction,reconcile}.ts
+│   ├── prompts/{extraction,nextstep,reconcile}.ts # the multi-paragraph system prompts
 │   ├── agent/{thread,intents,loop,execute,render,llm,approval,escape}.ts
 │   ├── channels/cli-turn.ts                    # CLI channel core; src/cli.ts is I/O only
 │   ├── evals/harness.ts                        # prompt evals: render + score via the loop's own path
@@ -181,13 +181,45 @@ losers fail loudly, but the log would still record a garbled conversation).
    New read paths must not silently reintroduce exact three-column equality —
    that is the bug that made the curator agent blind to every user memory.
 
+### Offline reconciliation (`memory/reconcile.ts`)
+
+The counterpart to ADD-only extraction, and the only path where a model decides
+to rewrite or delete stored memory. Four rules make that safe enough to ship:
+
+1. **Plan by default.** `reconcile()` returns the decision list; `apply: true`
+   is what writes. `bun run reconcile` plans unless told otherwise.
+2. **Deletes are gated by volume, not by item.** More than
+   `DELETE_APPROVAL_THRESHOLD` (5) deletes in one pass applies *nothing* and
+   returns `awaiting_approval`. Holding back only the deletes would apply the
+   merges that justified them and leave the store duplicated, so the pass is
+   withheld whole.
+3. **A cluster is never emptied.** If every ref comes back DELETE the newest
+   member is force-kept — a later memory is the current state of the fact.
+4. **Mutations go through `ArchivalMemory`** with actor `reconcile`, so each one
+   re-embeds, reindexes FTS, relinks entities and writes its `memory_history`
+   row. This trades cross-decision atomicity (each mutation is its own
+   transaction) for those side effects; the audit trail is what makes a partial
+   pass reconstructible.
+
+**Clustering is raw cosine over stored vectors** (`ENGRAM_RECONCILE_THRESHOLD`,
+default 0.85 — between mem0's 0.95 entity upsert and its 0.5 read floor), seed-
+centric rather than single-link so A~B~C chaining cannot hand the model a topic
+instead of a duplicate. It is deliberately *not* `search()`: that score answers
+"how well does this row match a short query", and its adaptive divisor and
+boosts make it incomparable between two stored memories — on the test corpus a
+genuine near-duplicate pair scored 0.45 while a memory scored 0.62 against
+itself. The honest cost is that a memory with no vector cannot be clustered;
+the pass reports `skippedNoVector` rather than falling back to token overlap,
+which would cluster on shared stopwords.
+
+**No ADD verb**, unlike mem0's `DEFAULT_UPDATE_MEMORY_PROMPT`. mem0's reconciler
+runs against newly extracted facts, so ADD is how they enter the store; this one
+runs over memories that are already stored, and a minted memory would carry no
+`source_thread_id`/`source_event_seqs`. Consolidation is UPDATE on the keeper
+plus DELETE on the rest, keeping extraction the single ADD path.
+
 ## 7. Roadmap (specified, not yet built)
 
-- **Offline reconciliation** (`memory/reconcile.ts`): cluster near-duplicates by
-  cosine within scope, integer-ID map, ADD/UPDATE/DELETE/NONE prompt (mem0's
-  legacy `DEFAULT_UPDATE_MEMORY_PROMPT` design), validate returned IDs, apply in
-  one transaction with full audit; LLM-decided deletes above a batch threshold
-  pause as an approval gate.
 - **WebSocket topic fanout** of lifecycle events, so a client can watch threads
   it did not start. (Per-turn SSE streaming on `POST /threads` is built — §5;
   what remains is the many-threads, many-watchers fanout.)

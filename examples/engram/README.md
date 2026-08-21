@@ -21,6 +21,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 bun run chat                  # local REPL
 bun run dev                   # HTTP API on :7749
 bun run bench:entities        # entity-recall measurement (docs/RETRIEVAL-NOTES.md)
+bun run reconcile --user you  # offline consolidation pass; plans, applies only when asked
 bun run evals                 # prompt evals, recorded mode (see evals/README.md)
 ```
 
@@ -60,6 +61,24 @@ sleeping thread early; its pending scheduled wake is then consumed as stale.
 > threads and approve gated deletes, so the approval gate is a workflow control,
 > not a security boundary.
 
+### Offline reconciliation
+
+Extraction is ADD-only on purpose. Consolidating what has accumulated is a
+separate, explicitly-run job:
+
+```sh
+bun run reconcile --user hunter                            # plan only (default)
+bun run reconcile --user hunter --apply                    # write the plan
+bun run reconcile --user hunter --apply --approve-deletes  # ...including a large delete batch
+```
+
+It clusters near-duplicates by cosine (`ENGRAM_RECONCILE_THRESHOLD`), asks the
+model for UPDATE/DELETE/NONE per cluster, and applies the result through the
+archival facade so every mutation is audited with actor `reconcile`. A pass that
+wants to delete more than five memories applies **nothing** and reports
+`awaiting_approval`; a cluster is never emptied. Memories stored without a
+vector cannot be clustered and are reported, not guessed at.
+
 ## Configuration
 
 | Env var | Default | Meaning |
@@ -73,15 +92,16 @@ sleeping thread early; its pending scheduled wake is then consumed as stale.
 | `ENGRAM_EMBEDDINGS_API_KEY` | — | bearer token for the embeddings endpoint (omit for keyless local servers) |
 | `ENGRAM_MAX_STEPS` | `20` | LLM steps per turn (12-factor factor 10) |
 | `ENGRAM_SEMANTIC_THRESHOLD` | `0.3` | semantic gate before boosting; upstream mem0 defaults to `0.1` (see `docs/RETRIEVAL-NOTES.md`) |
+| `ENGRAM_RECONCILE_THRESHOLD` | `0.85` | cosine at which two stored memories are clustered as near-duplicates by `bun run reconcile` |
 | `ENGRAM_USER` | `$USER`, else `local` | memory scope for `bun run chat`; warns when neither is set (all sessions would share one scope) |
 | `ENGRAM_API_TOKEN` | — | when set, every route except `/health` requires `Authorization: Bearer <token>` |
 | `PORT` | `7749` | HTTP port |
 
 ## What's here vs. what's next
 
-Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, SSE streaming of a turn, hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, a pinned prepared-statement cache, two of the four CLAUDE.md CRITICAL rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
+Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, SSE streaming of a turn, the offline reconciliation job (cosine clustering, audited UPDATE/DELETE, volume-gated deletes), hybrid scoring, entity index, recorded-mode prompt evals, render-seam compaction of long threads, a pinned prepared-statement cache, two of the four CLAUDE.md CRITICAL rules enforced by PreToolUse hooks, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
 
-Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), WebSocket topic fanout of lifecycle events, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out.
+Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): WebSocket topic fanout of lifecycle events, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out.
 
 Known constraints (deliberate for a local-first example): the per-thread lock is in-process, so exactly one Engram process may own a database file; entity matching is exact normalized-text (no embedding round-trip) — plural/paraphrase mentions miss where mem0's semantic matching would hit, measurable via `explain: true`.
 
