@@ -9,7 +9,8 @@
     "chat": "bun run src/cli.ts",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
-    "bench:entities": "bun scripts/bench-entity-recall.ts"
+    "bench:entities": "bun scripts/bench-entity-recall.ts",
+    "verify:committed": "bash scripts/verify-committed.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",
