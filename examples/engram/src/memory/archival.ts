@@ -92,6 +92,13 @@ const SEMANTIC_THRESHOLD = Number(process.env.ENGRAM_SEMANTIC_THRESHOLD ?? 0.3);
 /** In degraded (no-embedder) mode the BM25 leg is the base signal; gate lightly. */
 const DEGRADED_THRESHOLD = 0.01;
 
+/** Hot path: every search, and the dedup probe on every insert. */
+export const ARCHIVAL_SQL = {
+  byHashInScope:
+    "SELECT * FROM memories WHERE hash = ? AND user_id = ? AND agent_id = ? AND run_id = ?",
+  byId: "SELECT * FROM memories WHERE id = ?",
+} as const;
+
 export class ArchivalMemory {
   private readonly entities: EntityIndex;
 
@@ -111,7 +118,7 @@ export class ArchivalMemory {
     const hash = this.contentHash(args.content);
     const scope = normalizeScope(args.scope);
     const existing = this.db
-      .query("SELECT * FROM memories WHERE hash = ? AND user_id = ? AND agent_id = ? AND run_id = ?")
+      .query(ARCHIVAL_SQL.byHashInScope)
       .get(hash, scope.userId, scope.agentId, scope.runId) as RawRow | null;
     if (existing) {
       return { id: existing.id, created: false, memory: rowToRecord(existing) };
@@ -166,7 +173,7 @@ export class ArchivalMemory {
       // contract instead of surfacing the UNIQUE violation.
       if (String((err as Error).message).includes("UNIQUE")) {
         const winner = this.db
-          .query("SELECT * FROM memories WHERE hash = ? AND user_id = ? AND agent_id = ? AND run_id = ?")
+          .query(ARCHIVAL_SQL.byHashInScope)
           .get(hash, scope.userId, scope.agentId, scope.runId) as RawRow | null;
         if (winner) return { id: winner.id, created: false, memory: rowToRecord(winner) };
       }
@@ -182,7 +189,7 @@ export class ArchivalMemory {
   }
 
   getById(id: string): MemoryRecord | null {
-    const row = this.db.query("SELECT * FROM memories WHERE id = ?").get(id) as RawRow | null;
+    const row = this.db.query(ARCHIVAL_SQL.byId).get(id) as RawRow | null;
     return row ? rowToRecord(row) : null;
   }
 
@@ -307,7 +314,7 @@ export class ArchivalMemory {
 
   /** Rewrite a memory's content: audits before/after, rehashes, re-embeds, relinks entities. */
   async update(id: string, newContent: string, actorId?: string): Promise<{ ok: boolean; message: string }> {
-    const row = this.db.query("SELECT * FROM memories WHERE id = ?").get(id) as RawRow | null;
+    const row = this.db.query(ARCHIVAL_SQL.byId).get(id) as RawRow | null;
     // Result strings never carry raw memory UUIDs — they flow into prompts.
     if (!row) return { ok: false, message: "memory not found — it may have been deleted already" };
 
@@ -365,7 +372,7 @@ export class ArchivalMemory {
 
   /** Delete a memory. The history row survives with is_deleted = 1 (soft in audit). */
   delete(id: string, actorId?: string): { ok: boolean; message: string } {
-    const row = this.db.query("SELECT * FROM memories WHERE id = ?").get(id) as RawRow | null;
+    const row = this.db.query(ARCHIVAL_SQL.byId).get(id) as RawRow | null;
     if (!row) return { ok: false, message: "memory not found — it may have been deleted already" };
     const write = this.db.transaction(() => {
       this.addHistory(id, row.content, null, "DELETE", true, actorId);

@@ -59,7 +59,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 
 | Path | Responsibility |
 |---|---|
-| `src/db/` | open/migrate the single SQLite file (WAL, strict); all DDL in `migrations/` |
+| `src/db/` | open/migrate the single SQLite file (WAL, strict); all DDL in `migrations/`; `statements.ts` claims bun's 20-slot query cache for the hot set |
 | `src/memory/core.ts` | Core tier: budgeted self-editable blocks, CAS versioning |
 | `src/memory/recall.ts` | Recall tier: event log (only writer), scope keys, FTS search, rolling window |
 | `src/memory/archival.ts` | Archival tier facade: insert/search/update/delete + history audit |

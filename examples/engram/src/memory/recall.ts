@@ -64,6 +64,20 @@ export interface RecallHit {
   snippet: string;
 }
 
+/**
+ * The statements on the hottest path. Exported so db/statements.ts can claim
+ * bun's 20 cache slots for them at startup using the SAME string the call site
+ * passes — a copy would drift and silently warm a statement nobody runs.
+ */
+export const RECALL_SQL = {
+  nextSeq: "SELECT COALESCE(MAX(seq), -1) + 1 AS seq FROM events WHERE thread_id = ?",
+  insertEvent: "INSERT INTO events (id, thread_id, seq, type, data, ts) VALUES (?, ?, ?, ?, ?, ?)",
+  insertEventFts: "INSERT INTO events_fts (content, event_id, thread_id) VALUES (?, ?, ?)",
+  touchThread: "UPDATE threads SET updated_at = ? WHERE id = ?",
+  getThread: "SELECT * FROM threads WHERE id = ?",
+  threadEvents: "SELECT * FROM events WHERE thread_id = ? ORDER BY seq ASC",
+} as const;
+
 export class RecallStore {
   constructor(private readonly db: Database) {}
 
@@ -80,10 +94,10 @@ export class RecallStore {
   }
 
   getThread(id: string): Thread {
-    const row = this.db.query("SELECT * FROM threads WHERE id = ?").get(id) as ThreadRow | null;
+    const row = this.db.query(RECALL_SQL.getThread).get(id) as ThreadRow | null;
     if (!row) throw new Error(`thread not found: ${id}`);
     const events = (
-      this.db.query("SELECT * FROM events WHERE thread_id = ? ORDER BY seq ASC").all(id) as EventRow[]
+      this.db.query(RECALL_SQL.threadEvents).all(id) as EventRow[]
     ).map(rowToEvent);
     return {
       id: row.id,
@@ -115,15 +129,15 @@ export class RecallStore {
     const ts = nowIso();
     const insert = this.db.transaction(() => {
       const row = this.db
-        .query("SELECT COALESCE(MAX(seq), -1) + 1 AS seq FROM events WHERE thread_id = ?")
+        .query(RECALL_SQL.nextSeq)
         .get(threadId) as { seq: number };
       this.db
-        .query("INSERT INTO events (id, thread_id, seq, type, data, ts) VALUES (?, ?, ?, ?, ?, ?)")
+        .query(RECALL_SQL.insertEvent)
         .run(id, threadId, row.seq, type, JSON.stringify(data ?? null), ts);
       this.db
-        .query("INSERT INTO events_fts (content, event_id, thread_id) VALUES (?, ?, ?)")
+        .query(RECALL_SQL.insertEventFts)
         .run(projectForFts(type, data), id, threadId);
-      this.db.query("UPDATE threads SET updated_at = ? WHERE id = ?").run(ts, threadId);
+      this.db.query(RECALL_SQL.touchThread).run(ts, threadId);
       return row.seq;
     });
     const seq = insert.immediate() as number;

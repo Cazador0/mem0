@@ -23,6 +23,16 @@ import { withThreadLock } from "./lock";
  * but before the loop finishes — is closed at startup by recoverPendingWakes.
  */
 
+/** Hot path: runs on every tick for the life of the process. */
+export const SCHEDULER_SQL = {
+  dueWakes: `SELECT id, thread_id, note, sleep_seq FROM schedules
+       WHERE fired = 0 AND wake_at <= ?
+         AND (claimed_at IS NULL OR claimed_at <= ?)`,
+  claimWake: `UPDATE schedules SET claimed_at = ?
+         WHERE id = ? AND fired = 0 AND (claimed_at IS NULL OR claimed_at <= ?)`,
+  markFired: "UPDATE schedules SET fired = 1 WHERE id = ?",
+} as const;
+
 /** How long a claim is honored before another ticker may reclaim the row. */
 export const WAKE_LEASE_MS = 5 * 60_000;
 
@@ -49,11 +59,7 @@ export async function tickScheduler(
   const leaseCutoff = new Date(now.getTime() - WAKE_LEASE_MS).toISOString();
 
   const due = deps.db
-    .query(
-      `SELECT id, thread_id, note, sleep_seq FROM schedules
-       WHERE fired = 0 AND wake_at <= ?
-         AND (claimed_at IS NULL OR claimed_at <= ?)`,
-    )
+    .query(SCHEDULER_SQL.dueWakes)
     .all(nowIsoStr, leaseCutoff) as Array<{
     id: string;
     thread_id: string;
@@ -66,10 +72,7 @@ export async function tickScheduler(
     // Take the lease. The row stays fired = 0: if we die now, the wake is not
     // lost, just delayed until the lease expires.
     const leased = deps.db
-      .query(
-        `UPDATE schedules SET claimed_at = ?
-         WHERE id = ? AND fired = 0 AND (claimed_at IS NULL OR claimed_at <= ?)`,
-      )
+      .query(SCHEDULER_SQL.claimWake)
       .run(nowIsoStr, row.id, leaseCutoff);
     if (leased.changes === 0) continue; // another ticker holds the lease
 
@@ -79,7 +82,7 @@ export async function tickScheduler(
       // wrote this row). Consume the row without disturbing the thread.
       const thread = deps.store.getThread(row.thread_id);
       if (!isSleeping(thread) || effectiveTail(thread)?.seq !== row.sleep_seq) {
-        deps.db.query("UPDATE schedules SET fired = 1 WHERE id = ?").run(row.id);
+        deps.db.query(SCHEDULER_SQL.markFired).run(row.id);
         return 0;
       }
 

@@ -42,6 +42,12 @@ interface CoreBlockRow {
   updated_at: string;
 }
 
+/** Hot path: rendered into every single system prompt. */
+export const CORE_SQL = {
+  getBlock: "SELECT * FROM core_blocks WHERE agent_id = ? AND label = ?",
+  listBlocks: "SELECT * FROM core_blocks WHERE agent_id = ? ORDER BY label",
+} as const;
+
 export class CoreMemory {
   constructor(private readonly db: Database) {}
 
@@ -62,14 +68,14 @@ export class CoreMemory {
 
   get(agentId: string, label: string): CoreBlock | null {
     const row = this.db
-      .query("SELECT * FROM core_blocks WHERE agent_id = ? AND label = ?")
+      .query(CORE_SQL.getBlock)
       .get(agentId, label) as CoreBlockRow | null;
     return row ? rowToBlock(row) : null;
   }
 
   list(agentId: string): CoreBlock[] {
     const rows = this.db
-      .query("SELECT * FROM core_blocks WHERE agent_id = ? ORDER BY label")
+      .query(CORE_SQL.listBlocks)
       .all(agentId) as CoreBlockRow[];
     return rows.map(rowToBlock);
   }

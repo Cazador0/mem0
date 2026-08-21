@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { loadConfig } from "../src/config";
 import { openDb } from "../src/db/database";
+import { prewarmStatementCache } from "../src/db/statements";
 import { RecallStore } from "../src/memory/recall";
 import { CoreMemory } from "../src/memory/core";
 import { ArchivalMemory } from "../src/memory/archival";
@@ -70,6 +71,7 @@ export function testWorld(opts: { script?: ScriptItem[]; embedder?: boolean; max
   const config = loadConfig();
   if (opts.maxSteps !== undefined) config.maxSteps = opts.maxSteps;
   const db = openDb(":memory:");
+  prewarmStatementCache(db);
   const store = new RecallStore(db);
   const core = new CoreMemory(db);
   const archival = new ArchivalMemory(db, opts.embedder === false ? null : new FakeEmbedder());

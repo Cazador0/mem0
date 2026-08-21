@@ -1,5 +1,6 @@
 import { loadConfig, type EngramConfig } from "./config";
 import { openDb } from "./db/database";
+import { prewarmStatementCache } from "./db/statements";
 import { RecallStore } from "./memory/recall";
 import { CoreMemory } from "./memory/core";
 import { ArchivalMemory } from "./memory/archival";
@@ -12,6 +13,7 @@ import type { EngramDeps } from "./deps";
 /** Wire the production dependency graph. Tests build their own with a ScriptedLLM. */
 export function bootstrap(config: EngramConfig = loadConfig()): EngramDeps {
   const db = openDb(config.dbPath);
+  prewarmStatementCache(db); // claim the query cache before anything else runs
   const store = new RecallStore(db);
   const core = new CoreMemory(db);
   const archival = new ArchivalMemory(db, resolveEmbedder(config));
