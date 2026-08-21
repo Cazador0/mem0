@@ -72,6 +72,13 @@ export interface HistoryRow {
 }
 
 /** Semantic gate applied before any boosting (mem0's threshold discipline). */
+/**
+ * Vector-leg candidate ceiling. Keyword and entity hits are always included on
+ * top of this, so the bound costs semantic-only recall on old memories, never
+ * keyword recall (mem0 bounds its own entity search at top_k = 500).
+ */
+export const CANDIDATE_LIMIT = 500;
+
 const SEMANTIC_THRESHOLD = 0.3;
 /** In degraded (no-embedder) mode the BM25 leg is the base signal; gate lightly. */
 const DEGRADED_THRESHOLD = 0.01;
@@ -182,21 +189,50 @@ export class ArchivalMemory {
    */
   async search(args: SearchArgs): Promise<ScoredMemory[]> {
     const topK = args.topK ?? 5;
+    const memoryType = args.memoryType ?? "";
     const { where, params } = scopeFilter(args.scope);
-    const rows = (
-      this.db
+
+    // Keyword and entity legs run first: each does its own scoped, bounded SQL,
+    // and their hits are candidates no matter how old they are.
+    const bm25All = this.bm25Scores(args.query, args.scope);
+    const entityAll = this.entities.boostsForQuery(args.query, args.scope);
+    const keywordIds = new Set([...Object.keys(bm25All), ...Object.keys(entityAll)]);
+
+    // Candidate set = those hits UNION the most recent CANDIDATE_LIMIT rows.
+    // Reads are user-scoped, so the unbounded version materialized (and cosined)
+    // every memory the user has ever stored on every loop iteration via
+    // prefetch. Tradeoff: a memory that is neither a keyword/entity hit nor
+    // recent enough can no longer be recovered by semantic similarity alone.
+    const byId = new Map<string, RawRow>();
+    for (const row of this.db
+      .query(
+        `SELECT * FROM memories
+         WHERE ${where} AND (? = '' OR memory_type = ?)
+         ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(...params, memoryType, memoryType, CANDIDATE_LIMIT) as RawRow[]) {
+      byId.set(row.id, row);
+    }
+    const missing = [...keywordIds].filter(id => !byId.has(id));
+    if (missing.length > 0) {
+      // Re-applies scope and type, so a keyword hit can never widen the scope.
+      for (const row of this.db
         .query(
           `SELECT * FROM memories
-           WHERE ${where}
-             AND (? = '' OR memory_type = ?)`,
+           WHERE id IN (${missing.map(() => "?").join(",")})
+             AND ${where} AND (? = '' OR memory_type = ?)`,
         )
-        .all(...params, args.memoryType ?? "", args.memoryType ?? "") as RawRow[]
-    ).filter(row => args.showExpired || !isExpired(row));
+        .all(...missing, ...params, memoryType, memoryType) as RawRow[]) {
+        byId.set(row.id, row);
+      }
+    }
+
+    const rows = [...byId.values()].filter(row => args.showExpired || !isExpired(row));
     if (rows.length === 0) return [];
 
     const inScope = new Set(rows.map(r => r.id));
-    const bm25Raw = filterKeys(this.bm25Scores(args.query, args.scope), inScope);
-    const entityBoosts = filterKeys(this.entities.boostsForQuery(args.query, args.scope), inScope);
+    const bm25Raw = filterKeys(bm25All, inScope);
+    const entityBoosts = filterKeys(entityAll, inScope);
     const explain = args.explain ?? false;
 
     if (!this.embedder) {
@@ -467,7 +503,13 @@ function scopeFilter(scope: Scope, prefix = ""): { where: string; params: string
     clauses.push(`${prefix}run_id = ?`);
     params.push(scope.runId);
   }
-  return { where: clauses.length > 0 ? clauses.join(" AND ") : "1 = 1", params };
+  if (clauses.length === 0) {
+    // Fail closed. An empty scope is always a caller bug, and emitting "1 = 1"
+    // would silently turn the narrowest possible request into a cross-user
+    // read of every memory in the database.
+    throw new Error("archival read requires at least one scope key (userId/agentId/runId)");
+  }
+  return { where: clauses.join(" AND "), params };
 }
 
 function isExpired(row: RawRow): boolean {

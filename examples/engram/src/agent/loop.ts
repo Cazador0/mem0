@@ -1,5 +1,12 @@
 import { envelopeForIntents, routeIntent, type NextStep } from "./intents";
-import { consecutiveErrors, deriveStatus, lastEvent, stepsThisTurn, type Thread } from "./thread";
+import {
+  consecutiveErrors,
+  deriveStatus,
+  effectiveTail,
+  lastEvent,
+  stepsThisTurn,
+  type Thread,
+} from "./thread";
 import { executeStep } from "./execute";
 import { compactError, renderUserMessage } from "./render";
 import { buildSystemPrompt } from "../prompts/nextstep";
@@ -126,7 +133,11 @@ function escalateIfStuck(deps: EngramDeps, thread: Thread): boolean {
   deps.store.appendEvent(thread.id, "tool_call", {
     intent: "request_human_input",
     question: "I hit repeated errors and need guidance before continuing.",
-    context: String((thread.events[thread.events.length - 1]?.data as { message?: string })?.message ?? ""),
+    // effectiveTail for consistency with every other tail read. (The raw tail
+    // would be equivalent here — the caller appends the error and reloads
+    // synchronously just above — but two notions of "the tail" in one file is
+    // how the next annotation type sneaks in a bug.)
+    context: String((effectiveTail(thread)?.data as { message?: string })?.message ?? ""),
     urgency: "high",
   });
   return true;

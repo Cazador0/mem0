@@ -22,6 +22,8 @@ import {
   buildRefMap,
   consecutiveErrors,
   deriveStatus,
+  effectiveTail,
+  eventAsStep,
   stepsThisTurn,
 } from "../src/agent/thread";
 
@@ -717,6 +719,39 @@ describe("review regressions", () => {
     expect(deriveStatus(final)).toBe("awaiting_human");
     expect(final.events.filter(e => e.type === "error")).toEqual([]);
     expect(resumed.events.length).toBeLessThanOrEqual(final.events.length);
+  });
+
+  test("escalation quotes the last error as context, never an empty question", async () => {
+    // NOTE ON SCOPE: this documents behavior, it does not pin a defect. An audit
+    // flagged that escalateIfStuck read the raw tail while consecutiveErrors now
+    // skips memory_write, so an annotation could supply the context. It cannot,
+    // in fact: the loop appends the error and reloads synchronously right before
+    // escalating, so no concurrent append can land in between on one event loop.
+    // The read was switched to effectiveTail for consistency with every other
+    // tail read; reverting it does NOT fail this test, and that is expected.
+    const { deps, llm } = testWorld({
+      script: [{ __throw: "model down" }, { __throw: "model down" }, { __throw: "model down" }],
+    });
+    const thread = deps.store.createThread("engram", SCOPE);
+    deps.store.appendEvent(thread.id, "user_input", "do the thing");
+    await agentLoop(thread.id, deps);
+
+    // Three errors accumulated; a background extraction lands its annotation.
+    expect(deps.store.getThread(thread.id).events.filter(e => e.type === "error").length).toBe(3);
+    deps.store.appendEvent(thread.id, "memory_write", { count: 1, ids: ["m"] });
+
+    llm.push({ __throw: "model down" });
+    const escalated = await agentLoop(thread.id, deps);
+    const ask = eventAsStep(effectiveTail(escalated));
+    expect(ask?.intent).toBe("request_human_input");
+
+    // The context is the last real ERROR's message. Reading the raw tail would
+    // pick up the memory_write annotation, whose payload has no `message`, and
+    // hand the human an empty question.
+    const lastError = [...escalated.events].reverse().find(e => e.type === "error")!;
+    const expected = (lastError.data as { message: string }).message;
+    expect(expected).not.toBe("");
+    expect((ask as { context?: string }).context).toBe(expected);
   });
 
   test("a crash between claiming a wake and recording it does not lose the wake", async () => {

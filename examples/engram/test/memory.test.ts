@@ -4,7 +4,7 @@ import { closeDb, openDb, probeFts5 } from "../src/db/database";
 import { mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ArchivalMemory } from "../src/memory/archival";
+import { ArchivalMemory, CANDIDATE_LIMIT } from "../src/memory/archival";
 import { EntityIndex, extractEntities } from "../src/memory/entities";
 import { crowdPenalty, ENTITY_BOOST_WEIGHT, getBm25Params, scoreAndRank } from "../src/memory/scoring";
 import { buildScopeKey, RecallStore, stripIdentityKeys } from "../src/memory/recall";
@@ -336,6 +336,36 @@ describe("archival tier: mutations and read filters", () => {
     expect(hits.length).toBe(1);
     expect(hits[0]!.payload.content).toContain("Neovim");
   });
+
+  test("an empty scope fails closed instead of reading every user's memories", async () => {
+    const { deps } = testWorld();
+    await deps.archival.insert({ content: "Alice's favorite color is teal.", scope: { userId: "alice" } });
+    await deps.archival.insert({ content: "Bob's favorite color is teal.", scope: { userId: "bob" } });
+
+    // Subset scoping means "no keys" would otherwise mean "no restriction".
+    expect(deps.archival.search({ query: "favorite color teal", scope: {} })).rejects.toThrow(
+      /at least one scope key/,
+    );
+    const alice = await deps.archival.search({ query: "favorite color teal", scope: { userId: "alice" } });
+    expect(alice.map(h => h.payload.content)).toEqual(["Alice's favorite color is teal."]);
+  });
+
+  test("a keyword hit outside the recency window is still a candidate", async () => {
+    // Reads are user-scoped, so the vector leg is bounded by recency; keyword
+    // and entity hits must be unioned on top or old memories become invisible.
+    const { deps } = testWorld({ embedder: false });
+    const scope = { userId: "u1" };
+    const { id: oldId } = await deps.archival.insert({
+      content: "User's childhood cat was named Zbigniew.",
+      scope,
+    });
+    for (let i = 0; i < CANDIDATE_LIMIT + 5; i++) {
+      await deps.archival.insert({ content: `Routine note number ${i} about daily standups.`, scope });
+    }
+
+    const hits = await deps.archival.search({ query: "Zbigniew", scope });
+    expect(hits.map(h => h.id)).toContain(oldId);
+  }, 30_000);
 
   test("expired memories are filtered at read time", async () => {
     const { deps } = testWorld();

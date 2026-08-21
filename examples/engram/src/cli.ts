@@ -1,5 +1,6 @@
 import { loadConfig } from "./config";
 import { bootstrap } from "./bootstrap";
+import { closeDb } from "./db/database";
 import { agentLoop } from "./agent/loop";
 import { extractFromThread } from "./memory/extraction";
 import { startScheduler } from "./orchestration/scheduler";
@@ -28,6 +29,14 @@ if (!configuredUser) {
 }
 const userId = configuredUser || "local";
 const thread = deps.store.createThread("engram", { userId, agentId: "engram" });
+
+// Ctrl+C is the normal way out of a REPL, so it is the normal shutdown path:
+// checkpoint the WAL rather than leaving sidecars behind.
+process.on("SIGINT", () => {
+  console.log("\n[engram] closing the database");
+  closeDb(deps.db);
+  process.exit(0);
+});
 
 console.log(`engram chat — thread ${thread.id} (model ${config.model}). Type a message; Ctrl+C to exit.\n`);
 process.stdout.write("> ");
