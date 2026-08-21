@@ -10,7 +10,9 @@
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
     "bench:entities": "bun scripts/bench-entity-recall.ts",
-    "verify:committed": "bash scripts/verify-committed.sh"
+    "verify:committed": "bash scripts/verify-committed.sh",
+    "evals": "bun test test/prompt-evals.test.ts",
+    "evals:record": "bun scripts/record-evals.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.117.1",

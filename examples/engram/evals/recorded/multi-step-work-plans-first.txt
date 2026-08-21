@@ -1,0 +1,24 @@
+{
+  "next_step": {
+    "intent": "propose_plan",
+    "summary": "Review travel memories, propose merges, and get approval before any deletion.",
+    "steps": [
+      "Search archival memory for travel-related memories",
+      "Group near-duplicates and propose a merged wording for each",
+      "List memories older than two years as deletion candidates",
+      "Ask for approval before deleting anything",
+      "Write the summary from what remains"
+    ],
+    "gate_results": [
+      {
+        "principle": "The LLM proposes, code disposes",
+        "pass": true,
+        "justification": "Every deletion goes through the approval gate rather than executing directly."
+      },
+      {
+        "principle": "Every memory mutation is audited",
+        "pass": true
+      }
+    ]
+  }
+}

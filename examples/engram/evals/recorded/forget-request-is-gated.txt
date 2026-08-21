@@ -1,0 +1,9 @@
+The search turned up one matching memory, so I'll request its deletion.
+
+{
+  "next_step": {
+    "intent": "memory_delete",
+    "ref": 1,
+    "reason": "The user asked me to forget their old address."
+  }
+}

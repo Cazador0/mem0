@@ -1,0 +1,7 @@
+{
+  "next_step": {
+    "intent": "archival_insert",
+    "content": "The user is named Hunter and has a dog named Poppy; their morning walks together are the highlight of the user's day (stated August 2026).",
+    "memory_type": "fact"
+  }
+}

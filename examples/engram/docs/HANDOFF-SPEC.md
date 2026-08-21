@@ -96,9 +96,11 @@ engram/
 │   ├── prompts/{extraction,nextstep}.ts        # every LLM-facing template in one place
 │   ├── agent/{thread,intents,loop,execute,render,llm,approval}.ts
 │   ├── channels/cli-turn.ts                    # CLI channel core; src/cli.ts is I/O only
+│   ├── evals/harness.ts                        # prompt evals: render + score via the loop's own path
 │   ├── agents/registry.ts
 │   ├── orchestration/{gates,scheduler,lock}.ts # lock = per-thread promise mutex
 │   └── server/routes.ts
+├── evals/{fixtures.ts,recorded/*.txt,README.md}  # prompt-eval corpus (recorded mode)
 └── test/{harness,preload}.ts + *.test.ts
 ```
 
@@ -158,8 +160,6 @@ losers fail loudly, but the log would still record a garbled conversation).
 - **Capsule compiler + review fan-out** (BMAD): compile self-contained task
   capsules harvesting prior Agent Records + archival memory; parallel reviewers
   with asymmetric context envelopes; section-level write permissions enforced in code.
-- **Prompt evals**: fixture threads (same serialization as `render.ts`) run against
-  the live model asserting chosen intents — recorded-response mode for CI.
 - **CLAUDE.md generator** (`context/claudemd.ts`): marker-region upsert handling
   all four corruption states, manifest-hash ownership, pointer-not-copy content.
 - **Render-seam compaction**: today everything beyond the 50-event verbatim tail
