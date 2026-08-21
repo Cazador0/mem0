@@ -100,6 +100,7 @@ engram/
 │   ├── agents/registry.ts
 │   ├── orchestration/{gates,scheduler,lock}.ts # lock = per-thread promise mutex
 │   └── server/routes.ts
+├── .claude/{settings.json,hooks/*.js}           # CRITICAL rules enforced as PreToolUse denials
 ├── evals/{fixtures.ts,recorded/*.txt,README.md}  # prompt-eval corpus (recorded mode)
 └── test/{harness,preload}.ts + *.test.ts
 ```
@@ -193,9 +194,6 @@ losers fail loudly, but the log would still record a garbled conversation).
   so `recall_search` still reaches the originals.
 - **Statement-cache trim**: precompile the hot path (appendEvent, search) as a
   fixed set of ≤20 `db.query()` statements; move the long tail to `prepare()`.
-- **Mechanical rule enforcement**: PreToolUse hooks that deny `bun test` against
-  a real `.sqlite` path and raw INSERTs into `events`/`memories` in test code —
-  bun's proven pattern, deriving the repo root rather than hardcoding it.
 
 **Threat model note**: the HTTP server is unauthenticated by default (local-first
 example); `ENGRAM_API_TOKEN` opts into bearer auth on every route except

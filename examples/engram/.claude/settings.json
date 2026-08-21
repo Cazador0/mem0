@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "bun .claude/hooks/pre-bash-hermetic-tests.js" }]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [{ "type": "command", "command": "bun .claude/hooks/pre-edit-no-raw-sql.js" }]
+      }
+    ]
+  }
+}

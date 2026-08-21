@@ -15,6 +15,7 @@ bun run verify:committed # run the suite against what git actually committed
 ```
 
 - **CRITICAL: a green `bun test` proves nothing about what you shipped.** The repo-root `.gitignore` has a bare `db` pattern that once silently excluded this app's entire `src/db/` layer from every commit while local runs stayed green. Before pushing, run `bun run verify:committed` — it extracts `HEAD` and runs the suite there.
+- These CRITICAL rules are not prose-only: `.claude/hooks/` denies the violating tool call and re-states the correct command (bun's pattern, deriving the app root rather than hardcoding a cwd). `test/hooks.test.ts` pins both directions — the violation refused, the legitimate neighbours allowed.
 - **CRITICAL: tests must stay offline and hermetic.** Every test builds its world through `test/harness.ts` (`testWorld()` = in-memory DB + `ScriptedLLM` + `FakeEmbedder`). Never instantiate `AnthropicLLM` in a test, never point a test at a real `.sqlite` file.
   - *Exception*: WAL sidecar behavior is invisible in `:memory:`, so the `closeDb` checkpoint test may create a throwaway DB under `mkdtempSync(tmpdir())` and must `rmSync` it in a `finally`. Never a path a human would recognize as theirs.
 - **CRITICAL: never write to the `events` or `memories` tables directly.** Events go through `RecallStore.appendEvent` (seq allocation + FTS projection + immediate transaction); archival mutations go through `ArchivalMemory` (hash dedup + history audit + entity relink). A raw `INSERT`/`UPDATE`/`DELETE` bypasses the audit trail and corrupts derived state.
