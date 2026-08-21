@@ -5,7 +5,7 @@
 - **[12-factor-agents]** — the agent is a *stateless reducer* over an append-only event log; one Claude call per step returns one **intent** from a Zod discriminated union; a routing switch decides execute-and-continue vs persist-and-break; approvals replay the recorded step verbatim.
 - **[mem0]** — the archival write path is the V3 phased, **ADD-only extraction pipeline** (temporal grounding, integer-ref indirection, hash dedup in code, append-only history audit, best-effort entity index) and hybrid retrieval scoring (cosine + sigmoid-BM25 + entity boost with crowd penalty).
 - **MemGPT-style tiers, stored the mem0 way** — **Core** blocks the agent self-edits live in every prompt with visible budget pressure; **Recall** is the event log + FTS5; **Archival** is vector BLOBs + FTS5 in the same SQLite file.
-- **[spec-kit]** — a semver'd `constitution.md` referenced (never inlined); a structured gate-results module (`{principle, pass, justification?}` — pipeline wiring is roadmap); bounded clarification markers; deterministic code gathers facts before LLM judgment; CLAUDE.md managed regions hold pointers, not copies.
+- **[spec-kit]** — a semver'd `constitution.md` referenced (never inlined); constitution gates evaluated in code on every `propose_plan` (`{principle, pass, justification?}` — justify or be sent back); bounded clarification markers; deterministic code gathers facts before LLM judgment; CLAUDE.md managed regions hold pointers, not copies.
 - **[BMAD-METHOD]** — specialist agents as data with scoped intent unions; subagents run on fresh threads and return only `{verdict, summary, ref}` while full output stays in the child thread.
 - **[bun]** — `bun:sqlite` (WAL, FTS5, transactions), UUIDv7 sortable ids, xxHash64 content fingerprints, and the layered CLAUDE.md/AGENTS.md context-engineering shape.
 
@@ -20,6 +20,7 @@ bun test                      # hermetic: in-memory DB + scripted LLM, no API ke
 export ANTHROPIC_API_KEY=sk-ant-...
 bun run chat                  # local REPL
 bun run dev                   # HTTP API on :7749
+bun run bench:entities        # entity-recall measurement (docs/RETRIEVAL-NOTES.md)
 ```
 
 Try in chat: *"My dog is named Poppy and we walk every morning"* → the agent updates its `human` core block and archives the fact; in a later thread, prefetch injects it back into context.
@@ -39,9 +40,11 @@ curl -X POST :7749/threads/<id>/response \
 scope would silently merge every caller's memory. A `response` also wakes a
 sleeping thread early; its pending scheduled wake is then consumed as stale.
 
-> **Threat model**: the HTTP server has no authentication — it is a local-first
-> example. On an exposed port, anyone can resume threads and approve gated
-> deletes, so the approval gate is a workflow control, not a security boundary.
+> **Threat model**: the HTTP server is **unauthenticated by default** — it is a
+> local-first example. Set `ENGRAM_API_TOKEN` to require a bearer token on every
+> route except `/health`. Without it, anyone who can reach the port can resume
+> threads and approve gated deletes, so the approval gate is a workflow control,
+> not a security boundary.
 
 ## Configuration
 
@@ -54,14 +57,16 @@ sleeping thread early; its pending scheduled wake is then consumed as stale.
 | `ENGRAM_EMBEDDINGS_URL` | — | OpenAI-compatible embeddings base URL; unset = degraded FTS+entity search |
 | `ENGRAM_EMBEDDINGS_MODEL` / `_DIMS` | `text-embedding-3-small` / `1536` | embedding config |
 | `ENGRAM_EMBEDDINGS_API_KEY` | — | bearer token for the embeddings endpoint (omit for keyless local servers) |
-| `ENGRAM_MAX_STEPS` | `20` | LLM steps per loop entry (12-factor factor 10) |
+| `ENGRAM_MAX_STEPS` | `20` | LLM steps per turn (12-factor factor 10) |
+| `ENGRAM_USER` | `$USER`, else `local` | memory scope for `bun run chat`; warns when neither is set (all sessions would share one scope) |
+| `ENGRAM_API_TOKEN` | — | when set, every route except `/health` requires `Authorization: Bearer <token>` |
 | `PORT` | `7749` | HTTP port |
 
 ## What's here vs. what's next
 
-Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark) with provenance + linking, hybrid scoring, entity index, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI shares the tested thread machinery and its approval-reply parsing is unit-tested; the interactive REPL itself is exercised manually, not in CI.
+Implemented and tested: the reducer loop with routing/gating/escalation, all three memory tiers with audit history, cross-agent user-scoped retrieval, the extraction pipeline (per-thread serialized, monotonic watermark, bounded retry of failed inserts) with provenance + linking, exactly-once durable wake delivery (lease + startup recovery), constitution-gated planning, opt-in bearer auth, hybrid scoring, entity index, durable sleep + scheduler, subagent spawn, HTTP pause/resume including approval and early-wake happy paths. The CLI's turn dispatch (`src/channels/cli-turn.ts`) is tested end-to-end — approve, deny, ambiguous re-prompt, early wake, LLM failure — leaving only the terminal I/O shell in `src/cli.ts` manual.
 
-Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), wiring constitution-gate evaluation into a planning phase, compaction/distillation of the elided event region at the render seam, a scheduler wake lease + startup reset (delivery is currently at-most-once), trimming the hot path to bun:sqlite's 20-statement `db.query()` cache, PreToolUse hooks that mechanically enforce the CLAUDE.md CRITICAL rules, SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out, prompt-eval suite against the live model.
+Honest roadmap (designed in `docs/HANDOFF-SPEC.md`, not yet built): offline LLM reconciliation job (ADD/UPDATE/DELETE/NONE as an audited, approval-gated compaction pass), compaction/distillation of the elided event region at the render seam, trimming the hot path to bun:sqlite's 20-statement `db.query()` cache, PreToolUse hooks that mechanically enforce the CLAUDE.md CRITICAL rules, SSE token streaming, Worker-isolated extraction via `db.serialize()`, BMAD-style capsule compiler + asymmetric review fan-out, prompt-eval suite against the live model.
 
 Known constraints (deliberate for a local-first example): the per-thread lock is in-process, so exactly one Engram process may own a database file; entity matching is exact normalized-text (no embedding round-trip) — plural/paraphrase mentions miss where mem0's semantic matching would hit, measurable via `explain: true`.
 

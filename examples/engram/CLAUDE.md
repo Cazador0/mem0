@@ -10,9 +10,11 @@ bun test              # all tests: in-memory DB + ScriptedLLM, no network, no AP
 bun run typecheck     # tsc --noEmit
 bun run dev           # HTTP server on :7749 (needs ANTHROPIC_API_KEY)
 bun run chat          # local REPL   (needs ANTHROPIC_API_KEY)
+bun run bench:entities # entity-recall bench; results in docs/RETRIEVAL-NOTES.md
 ```
 
 - **CRITICAL: tests must stay offline and hermetic.** Every test builds its world through `test/harness.ts` (`testWorld()` = in-memory DB + `ScriptedLLM` + `FakeEmbedder`). Never instantiate `AnthropicLLM` in a test, never point a test at a real `.sqlite` file.
+  - *Exception*: WAL sidecar behavior is invisible in `:memory:`, so the `closeDb` checkpoint test may create a throwaway DB under `mkdtempSync(tmpdir())` and must `rmSync` it in a `finally`. Never a path a human would recognize as theirs.
 - **CRITICAL: never write to the `events` or `memories` tables directly.** Events go through `RecallStore.appendEvent` (seq allocation + FTS projection + immediate transaction); archival mutations go through `ArchivalMemory` (hash dedup + history audit + entity relink). A raw `INSERT`/`UPDATE`/`DELETE` bypasses the audit trail and corrupts derived state.
   - *Exception*: migrations in `src/db/migrations/` define the tables — schema DDL obviously doesn't go through the facades.
   - *Exception*: tests may READ tables directly to assert storage effects.
@@ -21,7 +23,7 @@ bun run chat          # local REPL   (needs ANTHROPIC_API_KEY)
 ## Test template
 
 ```typescript
-import { describe, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { step, testWorld } from "./harness";
 import { agentLoop } from "../src/agent/loop";
 
@@ -49,7 +51,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/memory/archival.ts` | Archival tier facade: insert/search/update/delete + history audit |
 | `src/memory/scoring.ts` | Hybrid scoring (mem0 port): cosine, sigmoid-BM25, entity boost, adaptive divisor |
 | `src/memory/entities.ts` | Best-effort entity→memories inverted index (regex extractor, no NLP dep) |
-| `src/memory/extraction.ts` | mem0-V3 phased ADD-only pipeline; only its LLM phase throws; serialized per thread (`extract:` lock) with a monotonic watermark |
+| `src/memory/extraction.ts` | mem0-V3 phased ADD-only pipeline; only its LLM phase throws; serialized per thread (`extract:` lock), monotonic watermark, bounded retry on partial insert failure |
 | `src/memory/prefetch.ts` | Deterministic memory injection at loop entry (12-factor appendix 13) |
 | `src/agent/thread.ts` | Thread/Event types, derived-status predicates, ref-map reconstruction |
 | `src/agent/intents.ts` | The Zod intent union + routing table + per-agent subsetting |
@@ -58,7 +60,8 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/agent/render.ts` | THE context seam: only place deciding what the model sees |
 | `src/agent/llm.ts` | Anthropic wrapper: schema-validated output, refusal handling, retries |
 | `src/agents/registry.ts` | Specialist agents as data (persona + intent subset) |
-| `src/orchestration/` | Constitution loading + gate-evaluation module (pipeline wiring: roadmap); durable-sleep scheduler; per-thread promise mutex (`lock.ts`) every loop entry and extraction must hold |
+| `src/orchestration/` | Constitution loading + gate evaluation (wired: `propose_plan` gates run in `executeStep`); durable-sleep scheduler (lease + startup recovery, exactly-once wakes); per-thread promise mutex (`lock.ts`) every loop entry and extraction must hold |
+| `src/channels/cli-turn.ts` | CLI channel core: free text + derived status -> one action (`src/cli.ts` is I/O only) |
 | `src/server/routes.ts` | Launch/pause/resume over HTTP; resume validated against derived status |
 
 ## Do NOT
