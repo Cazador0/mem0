@@ -281,16 +281,7 @@ export class ArchivalMemory {
       return this.degradedResults(rows, bm25Raw, entityBoosts, topK, explain);
     }
 
-    let queryVec: Float32Array | null = null;
-    try {
-      queryVec = await this.embedder.embed(args.query);
-    } catch (err) {
-      // A transient embed outage must degrade like every other embed call
-      // site (insert/update warn and continue) — never abort the search.
-      console.warn(
-        `[engram] query embedding failed, degrading to keyword search: ${(err as Error).message}`,
-      );
-    }
+    const queryVec = await this.embedQuery(args.query);
     if (!queryVec) {
       return this.degradedResults(rows, bm25Raw, entityBoosts, topK, explain);
     }
@@ -319,6 +310,24 @@ export class ArchivalMemory {
     );
 
     return [...primary, ...fallback].sort((a, b) => b.score - a.score).slice(0, topK);
+  }
+
+  /**
+   * The query vector `search()` scores against, or null when there is no
+   * embedder or the endpoint is down (a transient outage must degrade like
+   * every other embed call site — never abort the search).
+   *
+   * Public because the extraction reader Worker must not hold credentials: the
+   * main thread embeds, the Worker scores against the vector it is handed.
+   */
+  async embedQuery(text: string): Promise<Float32Array | null> {
+    if (!this.embedder) return null;
+    try {
+      return await this.embedder.embed(text);
+    } catch (err) {
+      console.warn(`[engram] query embedding failed, degrading to keyword search: ${(err as Error).message}`);
+      return null;
+    }
   }
 
   /** No usable query vector: the normalized BM25 leg becomes the base signal. */

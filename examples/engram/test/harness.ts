@@ -67,10 +67,16 @@ export interface TestWorld {
   llm: ScriptedLLM;
 }
 
-export function testWorld(opts: { script?: ScriptItem[]; embedder?: boolean; maxSteps?: number } = {}): TestWorld {
+export function testWorld(
+  opts: { script?: ScriptItem[]; embedder?: boolean; maxSteps?: number; dbPath?: string } = {},
+): TestWorld {
   const config = loadConfig();
   if (opts.maxSteps !== undefined) config.maxSteps = opts.maxSteps;
-  const db = openDb(":memory:");
+  // config.dbPath must describe the database actually opened: anything reading
+  // the path (the extraction reader Worker) would otherwise be pointed at a
+  // real file on disk while the test ran against :memory:.
+  config.dbPath = opts.dbPath ?? ":memory:";
+  const db = openDb(config.dbPath);
   prewarmStatementCache(db);
   const store = new RecallStore(db);
   const core = new CoreMemory(db);

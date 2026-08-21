@@ -109,11 +109,12 @@ engram/
 ├── .claude/{settings.json,hooks/*.js}           # CRITICAL rules enforced as PreToolUse denials
 ├── docs/{HANDOFF-SPEC,RETRIEVAL-NOTES}.md
 ├── evals/{fixtures.ts,recorded/*.txt,README.md}  # prompt-eval corpus (recorded mode)
-├── scripts/{bench-entity-recall,record-evals,reconcile}.ts, verify-committed.sh
+├── scripts/{bench-entity-recall,bench-extraction-worker,record-evals,reconcile}.ts, verify-committed.sh
 ├── src/
 │   ├── index.ts / cli.ts / bootstrap.ts / config.ts / deps.ts
 │   ├── db/{database,statements}.ts + db/migrations/00{1..5}_*.sql
 │   ├── memory/{core,recall,archival,scoring,entities,embeddings,extraction,prefetch,procedural,compaction,reconcile}.ts
+│   ├── memory/reader-{client,worker,protocol}.ts  # opt-in read-only scan Worker
 │   ├── prompts/{extraction,nextstep,reconcile}.ts # the multi-paragraph system prompts
 │   ├── agent/{thread,intents,loop,execute,render,llm,approval,escape}.ts
 │   ├── channels/cli-turn.ts                    # CLI channel core; src/cli.ts is I/O only
@@ -218,13 +219,37 @@ runs over memories that are already stored, and a minted memory would carry no
 `source_thread_id`/`source_event_seqs`. Consolidation is UPDATE on the keeper
 plus DELETE on the rest, keeping extraction the single ADD path.
 
+### Worker-isolated extraction reads (`memory/reader-*.ts`, opt-in)
+
+`ENGRAM_EXTRACTION_WORKER=on` moves extraction's Phase-1 candidate scan — up to
+`CANDIDATE_LIMIT` rows, every stored vector decoded and cosined — into a Worker.
+Three rules make that safe:
+
+1. **The Worker never writes.** It opens the database read-only, so WAL readers
+   coexist with the main thread's single writer. Every write stays on the main
+   thread under the `extract:<threadId>` lock. The spec's original "write batches
+   back through a single-writer queue" is realized as "there are no writes to
+   send back", which is the stronger version of the same invariant.
+2. **The Worker never embeds.** The main thread computes the query vector (it had
+   to embed anyway) and passes it; no API key, no network, no secret crosses the
+   boundary. `ArchivalMemory.embedQuery` exists for exactly this.
+3. **It is an optimization, never a dependency.** Spawn failure, an unopenable
+   path, or a mid-scan death falls back to the in-thread scan with a warning —
+   an extraction must not fail because a performance feature did.
+
+`db.serialize()` is used only for `:memory:` databases, which no second
+connection can reach; that copy is O(database size) *per scan*, so in-memory
+stores are where this feature can cost more than it saves. Measured numbers, and
+why it ships off by default, are in `docs/RETRIEVAL-NOTES.md`: the scan blocks
+the event loop for essentially its whole duration in-thread (79ms at 3000
+memories) versus ~1ms through the Worker. The gain is latency fairness, not
+throughput — nothing gets faster, other work stops being blocked.
+
 ## 7. Roadmap (specified, not yet built)
 
 - **WebSocket topic fanout** of lifecycle events, so a client can watch threads
   it did not start. (Per-turn SSE streaming on `POST /threads` is built — §5;
   what remains is the many-threads, many-watchers fanout.)
-- **Worker-isolated extraction**: `db.serialize()` snapshot → Worker → write
-  batches back through a single-writer queue.
 - **Capsule compiler + review fan-out** (BMAD): compile self-contained task
   capsules harvesting prior Agent Records + archival memory; parallel reviewers
   with asymmetric context envelopes; section-level write permissions enforced in code.

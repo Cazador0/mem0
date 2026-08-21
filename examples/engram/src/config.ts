@@ -18,6 +18,12 @@ export interface EngramConfig {
    * on every route except /health.
    */
   apiToken: string;
+  /**
+   * Run extraction's candidate scan in a read-only Worker instead of on the
+   * main thread. Off by default — see docs/RETRIEVAL-NOTES.md for what it buys
+   * and what it costs.
+   */
+  extractionWorker: boolean;
 }
 
 export function loadConfig(env: Record<string, string | undefined> = process.env): EngramConfig {
@@ -31,5 +37,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     maxSteps: Number(env.ENGRAM_MAX_STEPS ?? 20),
     port: Number(env.PORT ?? 7749),
     apiToken: env.ENGRAM_API_TOKEN ?? "",
+    extractionWorker: (env.ENGRAM_EXTRACTION_WORKER ?? "off") === "on",
   };
 }

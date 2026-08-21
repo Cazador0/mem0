@@ -104,3 +104,55 @@ them means an embedding round-trip per query entity — the exact cost this desi
 declined to pay. If entity ranking is ever trusted for something load-bearing,
 re-measure with a real embedder first; the entity index is best-effort by design
 (constitution VII) and nothing should depend on it firing.
+
+---
+
+# What the extraction reader Worker buys (`ENGRAM_EXTRACTION_WORKER=on`)
+
+Extraction's Phase 1 scans up to `CANDIDATE_LIMIT` (500) memories, decodes every
+stored vector and cosines it against the query. That runs on the same thread
+serving HTTP — including any open SSE stream. The Worker moves that scan to a
+**read-only** connection off the main thread; every write stays where it was,
+under the `extract:<threadId>` lock.
+
+Reproduce with:
+
+```sh
+bun scripts/bench-extraction-worker.ts            # 1000 memories
+BENCH_MEMORIES=3000 bun scripts/bench-extraction-worker.ts
+```
+
+| memories | path | wall ms | main-thread lag ms | probe ticks |
+|---|---|---|---|---|
+| 100 | in-thread | 7.0 | **6.2** | 3 |
+| 100 | worker | 5.0 | **0.1** | 8 |
+| 1000 | in-thread | 38.4 | **37.6** | 4 |
+| 1000 | worker | 55.4 | **4.5** | 48 |
+| 3000 | in-thread | 79.8 | **79.0** | 4 |
+| 3000 | worker | 75.8 | **1.3** | 69 |
+
+`main-thread lag` is the longest gap a 1ms interval timer observed while the
+scan ran — what an open SSE stream or an in-flight request actually feels.
+`probe ticks` is how many times that timer got to run at all; it is printed
+because a starved probe reports "0.0 lag", which is how this measurement was
+wrong the first time it was taken.
+
+**Read the lag column, not the wall column.** These are single runs on one
+machine: wall-clock differences of tens of milliseconds between the two paths
+are noise (the worker is "slower" at 1000 and "faster" at 3000). The lag
+difference is an order of magnitude and consistent — the in-thread scan blocks
+the event loop for essentially its whole duration, and the Worker path does not.
+
+**Why it is still off by default.** The gain is latency *fairness*, not
+throughput: nothing gets faster, other work stops being blocked. On a
+single-user local install with a few hundred memories, ~6ms of block is not
+worth a second thread. Turn it on when a store is large enough for the scan to
+be tens of milliseconds and something else is waiting — a server with open
+streams, or concurrent threads.
+
+**The `:memory:` caveat.** No second connection can reach an in-memory database,
+so an in-memory store travels to the Worker as a whole-database copy
+(`db.serialize()`) on *every* scan — O(database size) per call. File-backed
+stores use a read-only connection and copy nothing. The table above is
+file-backed; `:memory:` is the mode where this feature can cost more than it
+saves.

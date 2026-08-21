@@ -11,6 +11,7 @@ bun run typecheck     # tsc --noEmit
 bun run dev           # HTTP server on :7749 (needs ANTHROPIC_API_KEY)
 bun run chat          # local REPL   (needs ANTHROPIC_API_KEY)
 bun run bench:entities # entity-recall bench; results in docs/RETRIEVAL-NOTES.md
+bun run bench:worker   # extraction-worker bench; results in the same file
 bun run reconcile --user <id> # offline consolidation pass (plans unless --apply)
 bun run verify:committed # run the suite against what git actually committed
 ```
@@ -67,6 +68,7 @@ The `ScriptedLLM` validates every scripted item against the schema the caller re
 | `src/memory/scoring.ts` | Hybrid scoring (mem0 port): cosine, sigmoid-BM25, entity boost, adaptive divisor |
 | `src/memory/entities.ts` | Best-effort entity→memories inverted index (regex extractor, no NLP dep) |
 | `src/memory/extraction.ts` | mem0-V3 phased ADD-only pipeline; only its LLM phase throws; serialized per thread (`extract:` lock), monotonic watermark, bounded retry on partial insert failure |
+| `src/memory/reader-{client,worker,protocol}.ts` | Opt-in read-only Worker for extraction's candidate scan; never writes, falls back in-thread |
 | `src/memory/reconcile.ts` | Offline consolidation: cosine clustering, model-decided UPDATE/DELETE/NONE, volume-gated deletes; the only model-driven mutation path |
 | `src/memory/compaction.ts` | Distills pre-tail events into a stored summary; render shows it instead of a bare marker |
 | `src/memory/prefetch.ts` | Deterministic memory injection at loop entry (12-factor appendix 13) |
